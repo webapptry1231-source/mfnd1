@@ -50,6 +50,7 @@ class BotConfig:
     daily_loss_limit: float = float(os.getenv("DAILY_LOSS_LIMIT", "-15"))
     consecutive_loss_limit: int = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
     min_buys_5m: int = int(os.getenv("MIN_BUYS_5M", "5"))          # raised from 0
+    min_buy_usd: float = float(os.getenv("MIN_BUY_USD", "5.0"))    # NEW
 
     # Momentum scanner
     age_momentum_min: int = int(os.getenv("AGE_MOMENTUM_MIN", "900"))
@@ -57,10 +58,7 @@ class BotConfig:
     volume_spike_mult: float = float(os.getenv("VOLUME_SPIKE_MULT", "2.0"))
     momentum_score_threshold: int = int(os.getenv("MOMENTUM_SCORE_THRESHOLD", "35"))
     min_buy_ratio: float = float(os.getenv("MIN_BUY_RATIO", "0.65"))
-    birdeye_api_key: str = os.getenv("BIRDEYE_API_KEY", "")
-
-    # NEW: minimum buy size (prevents $1‑2 trades eating fees)
-    min_buy_usd: float = float(os.getenv("MIN_BUY_USD", "5.0"))
+    birdeye_api_key: str = os.getenv("BIRDEYE_API_KEY", "")       # from Railway
 
 config = BotConfig()
 
@@ -156,14 +154,16 @@ class Detector:
         }
         self.fourmeme_url = "https://four.meme/meme-api/v1/meme/query?page=1&pageSize=50&sort=createTime&order=desc&status=1"
         self.clanker_search_url = "https://api.dexscreener.com/latest/dex/search?q=clanker"
-        # No single fallback – we'll iterate chains
 
-    # ---- Exponential backoff ----
-    def _get_with_backoff(self, url, max_retries=4):
+    # ---- Exponential backoff with custom headers ----
+    def _get_with_backoff(self, url, max_retries=4, extra_headers=None):
         wait = 2
         for attempt in range(max_retries):
             try:
-                resp = requests.get(url, headers=self.headers, timeout=10)
+                headers = self.headers.copy()
+                if extra_headers:
+                    headers.update(extra_headers)
+                resp = requests.get(url, headers=headers, timeout=10)
                 if resp.status_code == 429:
                     logger.warning(f"Rate limited on {url}, waiting {wait}s")
                     time.sleep(wait)
@@ -193,7 +193,7 @@ class Detector:
                     result.append(url)
         return result
 
-    # ==================== NEW LAUNCH SCANNER (full multi-chain) ====================
+    # ==================== NEW LAUNCH SCANNER ====================
     def get_new_pools(self, selected_chain):
         new_pools = []
         now = time.time()
@@ -393,14 +393,15 @@ class Detector:
         momentum_pools = []
         now = time.time()
 
-        # 1. Birdeye trending (SOL only)
+        # 1. Birdeye trending (SOL only - uses free tier API key)
         if config.birdeye_api_key and selected_chain in ['SOL', 'ALL']:
             try:
                 url = "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=desc&offset=0&limit=50"
-                headers = {"x-api-key": config.birdeye_api_key, "x-chain": "solana", **self.headers}
-                resp = self._get_with_backoff(url)
+                extra_headers = {"X-API-KEY": config.birdeye_api_key, "x-chain": "solana"}
+                resp = self._get_with_backoff(url, extra_headers=extra_headers)
                 if resp and resp.status_code == 200:
                     data = resp.json().get('data', {}).get('items', [])
+                    logger.info(f"[BIRDEYE] Retrieved {len(data)} trending tokens")
                     for item in data:
                         mint = item.get('address')
                         if not mint or mint in self.seen_mints_per_chain['SOL']:
@@ -414,7 +415,7 @@ class Detector:
                             continue
                         buys = int(item.get('txns', {}).get('m5', {}).get('buys', 0) or 0)
                         sells = int(item.get('txns', {}).get('m5', {}).get('sells', 0) or 0)
-                        buy_ratio = buys / (buys + sells + 1)
+                        buy_ratio = buys / (buys + sells + 1) if (buys + sells) > 0 else 0
                         if buy_ratio < config.min_buy_ratio:
                             continue
                         pool = {
@@ -434,10 +435,15 @@ class Detector:
                         }
                         self.seen_mints_per_chain['SOL'].add(mint)
                         momentum_pools.append(pool)
+                elif resp and resp.status_code == 401:
+                    logger.error("Invalid Birdeye API key. Check BIRDEYE_API_KEY environment variable.")
+                elif resp and resp.status_code == 429:
+                    logger.warning("Birdeye rate limit reached, waiting 60s")
+                    time.sleep(60)
             except Exception as e:
                 logger.warning(f"Birdeye momentum error: {e}")
 
-        # 2. DexScreener fallback (per-chain) – CRITICAL FIX
+        # 2. DexScreener fallback (per‑chain)
         try:
             chains_to_scan = ['SOL'] if selected_chain == 'SOL' else \
                              ['BSC'] if selected_chain == 'BSC' else \
@@ -463,7 +469,7 @@ class Detector:
                     liq = float(p.get('liquidity', {}).get('usd', 0))
                     buys = p.get('txns', {}).get('m5', {}).get('buys', 0)
                     sells = p.get('txns', {}).get('m5', {}).get('sells', 0)
-                    buy_ratio = buys / (buys + sells + 1)
+                    buy_ratio = buys / (buys + sells + 1) if (buys + sells) > 0 else 0
                     if vol_5m < config.volume_5m * config.volume_spike_mult or buy_ratio < config.min_buy_ratio or liq < config.liq_min:
                         continue
                     chain_label_map = {'solana': 'SOL', 'bsc': 'BSC', 'base': 'BASE'}
@@ -557,7 +563,7 @@ class FilterEngine:
         try:
             age_sec = (datetime.datetime.now() - pool['created_at']).total_seconds()
         except:
-            age_sec = 300  # fallback
+            age_sec = 300
         max_vol_liq = 80 if age_sec < 300 else 50
         vol_liq = (pool.get('volume_5m', 0) * 288) / max(pool['liquidity'], 1)
         if vol_liq > max_vol_liq:
@@ -851,13 +857,13 @@ class Reporter:
         logger.info("Equity curve saved.")
 
 # ============================================================================
-# 7. Keep-alive + health ping
+# 7. Keep-alive + health ping (optional)
 # ============================================================================
-def keep_alive(notifier=None):
+def keep_alive():
     while True:
         time.sleep(300)  # every 5 min
         logger.info("[HEALTH] Bot is alive")
-        # Optional: send Telegram ping (uncomment when ready)
+        # Uncomment to send Telegram health ping (requires notifier reference)
         # if notifier:
         #     notifier.send("✅ Bot is alive")
 threading.Thread(target=keep_alive, daemon=True).start()
