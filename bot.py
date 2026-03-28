@@ -133,7 +133,6 @@ class Detector:
         self.max_mints = max_mints
         self.last_profile_fetch = 0
         self.last_search_fetch = {}
-        self.last_fourmeme_fetch = 0
         self.last_clanker_fetch = 0
 
         self.pump_fun_urls = [
@@ -152,7 +151,6 @@ class Detector:
             'BSC': "https://api.dexscreener.com/latest/dex/search?q=four.meme",
             'BASE': "https://api.dexscreener.com/latest/dex/search?q=zora+base"
         }
-        self.fourmeme_url = "https://four.meme/meme-api/v1/meme/query?page=1&pageSize=50&sort=createTime&order=desc&status=1"
         self.clanker_search_url = "https://api.dexscreener.com/latest/dex/search?q=clanker"
 
     # ---- Exponential backoff with custom headers ----
@@ -201,7 +199,6 @@ class Detector:
         # 1. Pump.fun (SOL only)
         if selected_chain in ['SOL', 'ALL']:
             for pf_url in self.pump_fun_urls:
-                # Pump.fun requires its own headers
                 pf_headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Accept": "application/json, text/plain, */*",
@@ -245,37 +242,7 @@ class Detector:
                 except Exception as e:
                     logger.error(f"Pump.fun error: {e}")
 
-        # 2. Four.meme (BSC-focused launcher)
-        if selected_chain in ['BSC', 'ALL'] and now - self.last_fourmeme_fetch > 30:
-            self.last_fourmeme_fetch = now
-            resp = self._get_with_backoff(self.fourmeme_url)
-            if resp and resp.status_code == 200:
-                try:
-                    data = resp.json().get('data', []) if isinstance(resp.json(), dict) else []
-                    for item in data:
-                        mint = item.get('address') or item.get('mint')
-                        if not mint or mint in self.seen_mints_per_chain['BSC']:
-                            continue
-                        pool = {
-                            'mint': mint,
-                            'symbol': item.get('symbol', '???'),
-                            'name': item.get('name', '???'),
-                            'price': float(item.get('priceUsd', 0) or 0),
-                            'liquidity': float(item.get('liquidity', 0) or 0),
-                            'volume_5m': float(item.get('volume5m', 0) or 0),
-                            'price_change_5m': float(item.get('priceChange5m', 0) or 0),
-                            'buys_5m': int(item.get('buys5m', 0) or 0),
-                            'created_at': datetime.datetime.fromtimestamp(item.get('createTime', now) / 1000),
-                            'socials': self._normalize_socials(item.get('socials', [])),
-                            'chain': 'BSC',
-                            'source': 'fourmeme'
-                        }
-                        self.seen_mints_per_chain['BSC'].add(mint)
-                        new_pools.append(pool)
-                except Exception as e:
-                    logger.error(f"Four.meme error: {e}")
-
-        # 3. Clanker (BASE) via DexScreener search
+        # 2. Clanker (BASE) via DexScreener search
         if selected_chain in ['BASE', 'ALL'] and now - self.last_clanker_fetch > 60:
             self.last_clanker_fetch = now
             resp = self._get_with_backoff(self.clanker_search_url)
@@ -303,7 +270,7 @@ class Detector:
                     self.seen_mints_per_chain['BASE'].add(mint)
                     new_pools.append(pool)
 
-        # 4. DexScreener token profiles (every 60s)
+        # 3. DexScreener token profiles (every 60s)
         if now - self.last_profile_fetch > 60:
             self.last_profile_fetch = now
             ds_new = 0
@@ -344,7 +311,7 @@ class Detector:
                 logger.error(f"DexScreener profiles error: {e}")
             logger.info(f"[NEW] dexscreener profiles: new={ds_new}")
 
-        # 5. Chain-specific DexScreener search (per chain)
+        # 4. Chain-specific DexScreener search (per chain)
         chains_to_search = (['SOL', 'BSC', 'BASE'] if selected_chain == 'ALL' else [selected_chain])
         chain_label_map = {'solana': 'SOL', 'bsc': 'BSC', 'base': 'BASE'}
 
@@ -402,10 +369,10 @@ class Detector:
         momentum_pools = []
         now = time.time()
 
-        # 1. Birdeye trending (SOL only)
+        # 1. Birdeye trending (SOL only) – corrected endpoint
         if config.birdeye_api_key and selected_chain in ['SOL', 'ALL']:
             try:
-                url = "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=desc&offset=0&limit=50"
+                url = "https://public-api.birdeye.so/defi/v1/token_trending?sort_by=rank&sort_type=desc&offset=0&limit=50"
                 extra_headers = {"X-API-KEY": config.birdeye_api_key, "x-chain": "solana"}
                 resp = self._get_with_backoff(url, extra_headers=extra_headers)
                 if resp and resp.status_code == 200:
@@ -545,9 +512,9 @@ class FilterEngine:
         self.config = config
 
     def filter_and_score(self, pool):
-        # Age filter – skip for real-time sources (pumpfun/fourmeme)
+        # Age filter – skip for real-time sources (pumpfun only now)
         source = pool.get('source', '')
-        if source not in ('pumpfun', 'fourmeme'):
+        if source not in ('pumpfun',):
             try:
                 age = (datetime.datetime.now() - pool['created_at']).total_seconds()
                 if age < self.config.age_min or age > self.config.age_max:
