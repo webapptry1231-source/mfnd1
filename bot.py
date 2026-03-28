@@ -153,7 +153,7 @@ class Detector:
         }
         self.clanker_search_url = "https://api.dexscreener.com/latest/dex/search?q=clanker"
 
-    # ---- Exponential backoff with custom headers ----
+    # ---- Exponential backoff with custom headers and debug logging ----
     def _get_with_backoff(self, url, max_retries=4, extra_headers=None):
         wait = 2
         for attempt in range(max_retries):
@@ -169,6 +169,7 @@ class Detector:
                     continue
                 if resp.status_code == 200:
                     return resp
+                # Log any non-200 status
                 logger.warning(f"HTTP {resp.status_code} on {url}")
                 return None
             except Exception as e:
@@ -195,6 +196,7 @@ class Detector:
     def get_new_pools(self, selected_chain):
         new_pools = []
         now = time.time()
+        pump_new = 0   # track pump.fun new coins separately for logging
 
         # 1. Pump.fun (SOL only)
         if selected_chain in ['SOL', 'ALL']:
@@ -237,7 +239,8 @@ class Detector:
                         }
                         self.seen_mints_per_chain['SOL'].add(mint)
                         new_pools.append(pool)
-                    logger.info(f"[NEW] pump.fun → {len(data)} fetched, {len(new_pools)} new")
+                        pump_new += 1
+                    logger.info(f"[NEW] pump.fun → {len(data)} fetched, {pump_new} new")
                     break
                 except Exception as e:
                     logger.error(f"Pump.fun error: {e}")
@@ -247,6 +250,7 @@ class Detector:
             self.last_clanker_fetch = now
             resp = self._get_with_backoff(self.clanker_search_url)
             if resp and resp.status_code == 200:
+                clanker_new = 0
                 for p in resp.json().get('pairs', []):
                     if p.get('chainId') != 'base':
                         continue
@@ -269,6 +273,12 @@ class Detector:
                     }
                     self.seen_mints_per_chain['BASE'].add(mint)
                     new_pools.append(pool)
+                    clanker_new += 1
+                if clanker_new > 0:
+                    logger.info(f"[NEW] clanker: {clanker_new} new")
+            elif resp:
+                # Already logged by _get_with_backoff
+                pass
 
         # 3. DexScreener token profiles (every 60s)
         if now - self.last_profile_fetch > 60:
@@ -307,9 +317,10 @@ class Detector:
                             self.seen_mints_per_chain[pool['chain']].add(mint)
                             new_pools.append(pool)
                             ds_new += 1
+                if ds_new > 0:
+                    logger.info(f"[NEW] dexscreener profiles: {ds_new} new")
             except Exception as e:
                 logger.error(f"DexScreener profiles error: {e}")
-            logger.info(f"[NEW] dexscreener profiles: new={ds_new}")
 
         # 4. Chain-specific DexScreener search (per chain)
         chains_to_search = (['SOL', 'BSC', 'BASE'] if selected_chain == 'ALL' else [selected_chain])
@@ -326,6 +337,7 @@ class Detector:
                 resp = self._get_with_backoff(url)
                 if not resp or resp.status_code != 200:
                     continue
+                search_new = 0
                 for p in resp.json().get('pairs', []):
                     chain_id = p.get('chainId', '').lower()
                     chain_matches = (
@@ -354,6 +366,9 @@ class Detector:
                     }
                     self.seen_mints_per_chain[sch].add(mint)
                     new_pools.append(pool)
+                    search_new += 1
+                if search_new > 0:
+                    logger.info(f"[NEW] dexscreener search {sch}: {search_new} new")
             except Exception as e:
                 logger.error(f"DexScreener search {sch} error: {e}")
 
@@ -369,15 +384,17 @@ class Detector:
         momentum_pools = []
         now = time.time()
 
-        # 1. Birdeye trending (SOL only) – corrected endpoint
+        # 1. Birdeye trending (SOL only) – with detailed logging
         if config.birdeye_api_key and selected_chain in ['SOL', 'ALL']:
             try:
+                # Try the v1 endpoint (latest docs)
                 url = "https://public-api.birdeye.so/defi/v1/token_trending?sort_by=rank&sort_type=desc&offset=0&limit=50"
                 extra_headers = {"X-API-KEY": config.birdeye_api_key, "x-chain": "solana"}
                 resp = self._get_with_backoff(url, extra_headers=extra_headers)
                 if resp and resp.status_code == 200:
                     data = resp.json().get('data', {}).get('items', [])
                     logger.info(f"[BIRDEYE] Retrieved {len(data)} trending tokens")
+                    birdeye_new = 0
                     for item in data:
                         mint = item.get('address')
                         if not mint or mint in self.seen_mints_per_chain['SOL']:
@@ -411,11 +428,11 @@ class Detector:
                         }
                         self.seen_mints_per_chain['SOL'].add(mint)
                         momentum_pools.append(pool)
-                elif resp and resp.status_code == 401:
-                    logger.error("Invalid Birdeye API key. Check BIRDEYE_API_KEY environment variable.")
-                elif resp and resp.status_code == 429:
-                    logger.warning("Birdeye rate limit reached, waiting 60s")
-                    time.sleep(60)
+                        birdeye_new += 1
+                    if birdeye_new > 0:
+                        logger.info(f"[BIRDEYE] {birdeye_new} new momentum candidates")
+                elif resp:
+                    logger.warning(f"Birdeye returned {resp.status_code} for {url}")
             except Exception as e:
                 logger.warning(f"Birdeye momentum error: {e}")
 
@@ -431,6 +448,7 @@ class Detector:
                 resp = self._get_with_backoff(url)
                 if not resp or resp.status_code != 200:
                     continue
+                ds_new = 0
                 for p in resp.json().get('pairs', []):
                     chain_id = p.get('chainId', '').lower()
                     if selected_chain != 'ALL' and chain_id != {'SOL':'solana','BSC':'bsc','BASE':'base'}.get(sch):
@@ -466,8 +484,17 @@ class Detector:
                     }
                     self.seen_mints_per_chain[sch].add(mint)
                     momentum_pools.append(pool)
+                    ds_new += 1
+                if ds_new > 0:
+                    logger.info(f"[MOMENTUM] DexScreener {sch}: {ds_new} new")
         except Exception as e:
             logger.error(f"DexScreener momentum error: {e}")
+
+        # Sync global seen set
+        for chain in self.seen_mints_per_chain:
+            self.seen_mints.update(self.seen_mints_per_chain[chain])
+        if len(self.seen_mints) > self.max_mints:
+            self.seen_mints = set(list(self.seen_mints)[-self.max_mints:])
 
         logger.info(f"[MOMENTUM] Found {len(momentum_pools)} momentum candidates")
         return momentum_pools
@@ -514,7 +541,7 @@ class FilterEngine:
     def filter_and_score(self, pool):
         # Age filter – skip for real-time sources (pumpfun only now)
         source = pool.get('source', '')
-        if source not in ('pumpfun',):
+        if source != 'pumpfun':   # only pump.fun is the real-time source now
             try:
                 age = (datetime.datetime.now() - pool['created_at']).total_seconds()
                 if age < self.config.age_min or age > self.config.age_max:
@@ -573,7 +600,7 @@ class FilterEngine:
         return filtered, "momentum_pass"
 
 # ============================================================================
-# 5. Trade Simulator
+# 5. Trade Simulator (unchanged)
 # ============================================================================
 class TradeSimulator:
     def __init__(self, notifier, config: BotConfig):
