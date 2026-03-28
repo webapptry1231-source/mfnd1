@@ -167,7 +167,6 @@ class Detector:
             if isinstance(x, str) and x:
                 result.append(x)
             elif isinstance(x, dict):
-                # try common keys: url, handle, value
                 url = x.get('url') or x.get('handle') or x.get('value')
                 if url:
                     result.append(url)
