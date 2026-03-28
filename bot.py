@@ -1,4 +1,3 @@
-
 import os
 import sys
 import time
@@ -23,22 +22,26 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 
 # Optional parameters with defaults
 BUY_AMOUNT = float(os.getenv("BUY_AMOUNT", "2.0"))
-PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "15.0"))
+PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "15.0"))  # low-tier default
 PROFIT_TARGET_ABS = float(os.getenv("PROFIT_TARGET_ABS", "0.75"))
 TIMEOUT_MIN = int(os.getenv("TIMEOUT_MIN", "10"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "20.0"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "10.0"))  # low-tier stop
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "10"))
-SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "50"))
+SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "40"))  # lowered
 MAX_RUN_HOURS = int(os.getenv("MAX_RUN_HOURS", "48"))   # 0 = infinite
 
 # Filter defaults
-AGE_MIN = int(os.getenv("AGE_MIN", "30"))
-AGE_MAX = int(os.getenv("AGE_MAX", "300"))
+AGE_MIN = int(os.getenv("AGE_MIN", "15"))
+AGE_MAX = int(os.getenv("AGE_MAX", "600"))
 LIQ_MIN = int(os.getenv("LIQ_MIN", "1000"))
 LIQ_MAX = int(os.getenv("LIQ_MAX", "20000"))
 VOLUME_5M = int(os.getenv("VOLUME_5M", "50"))
 REQUIRE_SOCIAL = os.getenv("REQUIRE_SOCIAL", "false").lower() == "true"
 CHAIN_SELECTOR = os.getenv("CHAIN_SELECTOR", "ALL")   # SOL, BSC, BASE, ALL
+
+# Risk management
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "-15"))   # stop buying if net loss below this
+CONSECUTIVE_LOSS_LIMIT = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
 
 # Data persistence
 DATA_PATH = Path("./data")
@@ -87,13 +90,18 @@ class TelegramNotifier:
         print("Telegram send failed after all retries.")
 
 # ============================================================================
-# 3. Detector Class (SOL + BSC + BASE)
+# 3. Detector Class (SOL + BSC + BASE) with optimizations
 # ============================================================================
 class Detector:
     def __init__(self, max_mints=25000):
         self.seen_mints = set()
         self.max_mints = max_mints
         self.last_profile_fetch = 0
+        self.last_search_fetch = 0
+        self.pump_fun_urls = [
+            "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC",
+            "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC"
+        ]
 
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -102,52 +110,63 @@ class Detector:
             "Referer": "https://dexscreener.com/",
         }
 
-        self.pump_fun_url = "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC"
         self.token_profile_url = "https://api.dexscreener.com/token-profiles/latest/v1"
+        self.dexscreener_search_url = "https://api.dexscreener.com/latest/dex/search?q=pump"
 
     def get_new_pools(self, selected_chain):
         new_pools = []
         now = time.time()
 
-        # 1. Pump.fun → SOL only
+        # 1. Pump.fun v3 (with fallback)
         if selected_chain in ['SOL', 'ALL']:
-            try:
-                resp = requests.get(self.pump_fun_url, headers=self.headers, timeout=12)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    with SOL_LOCK:
-                        sol_usd = SOL_USD
-                    for coin in data:
-                        mint = coin.get('mint')
-                        if not mint or mint in self.seen_mints:
-                            continue
-                        ts = coin.get('created_timestamp', now * 1000)
-                        created_at = datetime.datetime.fromtimestamp(ts / 1000)
-                        price_sol = float(coin.get('price', 0))
-                        price_usd = price_sol * sol_usd
-                        liquidity_raw = float(coin.get('liquidity', 0) or 5000)
-                        liquidity_usd = liquidity_raw * sol_usd if liquidity_raw < 10000 else liquidity_raw
-                        age_sec = max((now * 1000 - ts) / 1000, 60)
-                        total_vol_usd = float(coin.get('volume', 0)) * sol_usd
-                        volume_5m_usd = (total_vol_usd / age_sec) * 300
-                        pool = {
-                            'mint': mint,
-                            'symbol': coin.get('symbol', '???'),
-                            'name': coin.get('name', '???'),
-                            'price': price_usd,
-                            'liquidity': liquidity_usd,
-                            'volume_5m': volume_5m_usd,
-                            'created_at': created_at,
-                            'socials': [coin.get('twitter'), coin.get('telegram')] if coin.get('twitter') or coin.get('telegram') else [],
-                            'chain': 'SOL'
-                        }
-                        self.seen_mints.add(mint)
-                        new_pools.append(pool)
-            except Exception as e:
-                print(f"Pump.fun error: {e}")
+            for pf_url in self.pump_fun_urls:
+                try:
+                    resp = requests.get(pf_url, headers=self.headers, timeout=12)
+                    if resp.status_code == 200 and resp.text.strip():
+                        data = resp.json()
+                        if data:  # got real results
+                            with SOL_LOCK:
+                                sol_usd = SOL_USD
+                            for coin in data:
+                                mint = coin.get('mint')
+                                if not mint or mint in self.seen_mints:
+                                    continue
 
-        # 2. DexScreener profiles → SOL + BSC + BASE
-        if now - self.last_profile_fetch > 90:
+                                # Skip coins with zero liquidity (no data)
+                                liquidity_raw = float(coin.get('liquidity', 0) or 0)
+                                if liquidity_raw == 0:
+                                    continue
+
+                                ts = coin.get('created_timestamp', now * 1000)
+                                created_at = datetime.datetime.fromtimestamp(ts / 1000)
+                                price_sol = float(coin.get('price', 0))
+                                price_usd = price_sol * sol_usd
+                                liquidity_usd = liquidity_raw * sol_usd if liquidity_raw < 10000 else liquidity_raw
+                                age_sec = max((now * 1000 - ts) / 1000, 60)
+                                total_vol_usd = float(coin.get('volume', 0)) * sol_usd
+                                volume_5m_usd = (total_vol_usd / age_sec) * 300
+                                pool = {
+                                    'mint': mint,
+                                    'symbol': coin.get('symbol', '???'),
+                                    'name': coin.get('name', '???'),
+                                    'price': price_usd,
+                                    'liquidity': liquidity_usd,
+                                    'volume_5m': volume_5m_usd,
+                                    'created_at': created_at,
+                                    'socials': [coin.get('twitter'), coin.get('telegram')] if coin.get('twitter') or coin.get('telegram') else [],
+                                    'chain': 'SOL',
+                                    'price_change_5m': 0,     # pump.fun doesn't provide this
+                                    'buys_5m': 0              # pump.fun doesn't provide this
+                                }
+                                self.seen_mints.add(mint)
+                                new_pools.append(pool)
+                            break  # success, stop trying other URLs
+                except Exception as e:
+                    print(f"Pump.fun {pf_url} error: {e}")
+                    continue
+
+        # 2. DexScreener token profiles (every 60 seconds)
+        if now - self.last_profile_fetch > 60:
             self.last_profile_fetch = now
             try:
                 resp = requests.get(self.token_profile_url, headers=self.headers, timeout=10)
@@ -169,6 +188,7 @@ class Detector:
 
                         pair_data = self._fetch_pair_info(mint, chain_id)
                         if pair_data:
+                            chain_label_map = {'solana': 'SOL', 'bsc': 'BSC', 'base': 'BASE'}
                             pool = {
                                 'mint': mint,
                                 'symbol': pair_data.get('baseToken', {}).get('symbol', '???'),
@@ -176,14 +196,56 @@ class Detector:
                                 'price': float(pair_data.get('priceUsd', 0)),
                                 'liquidity': float(pair_data.get('liquidity', {}).get('usd', 0)),
                                 'volume_5m': float(pair_data.get('volume', {}).get('m5', 0)),
+                                'price_change_5m': float(pair_data.get('priceChange', {}).get('m5', 0)),
+                                'buys_5m': pair_data.get('txns', {}).get('m5', {}).get('buys', 0),
                                 'created_at': datetime.datetime.fromtimestamp(pair_data.get('pairCreatedAt', now*1000) / 1000),
                                 'socials': pair_data.get('info', {}).get('websites', []),
-                                'chain': chain_id.upper() if chain_id in ['solana','bsc','base'] else 'SOL'
+                                'chain': chain_label_map.get(chain_id, 'SOL')
                             }
                             self.seen_mints.add(mint)
                             new_pools.append(pool)
             except Exception as e:
                 print(f"DexScreener profiles error: {e}")
+
+        # 3. DexScreener search for "pump" (every 60 seconds, but stagger after profiles)
+        if now - self.last_search_fetch > 60:
+            self.last_search_fetch = now
+            try:
+                resp = requests.get(self.dexscreener_search_url, headers=self.headers, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    pairs = data.get('pairs', [])
+                    for p in pairs:
+                        chain_id = p.get('chainId', '').lower()
+                        # FIX: correct chain filter
+                        chain_matches = (
+                            selected_chain == 'ALL' or
+                            (selected_chain == 'SOL' and chain_id == 'solana') or
+                            (selected_chain == 'BSC' and chain_id == 'bsc') or
+                            (selected_chain == 'BASE' and chain_id == 'base')
+                        )
+                        if not chain_matches:
+                            continue
+                        mint = p.get('baseToken', {}).get('address')
+                        if not mint or mint in self.seen_mints:
+                            continue
+                        pool = {
+                            'mint': mint,
+                            'symbol': p.get('baseToken', {}).get('symbol', '???'),
+                            'name': p.get('baseToken', {}).get('name', '???'),
+                            'price': float(p.get('priceUsd', 0)),
+                            'liquidity': float(p.get('liquidity', {}).get('usd', 0)),
+                            'volume_5m': float(p.get('volume', {}).get('m5', 0)),
+                            'price_change_5m': float(p.get('priceChange', {}).get('m5', 0)),
+                            'buys_5m': p.get('txns', {}).get('m5', {}).get('buys', 0),
+                            'created_at': datetime.datetime.fromtimestamp(p.get('pairCreatedAt', now*1000) / 1000),
+                            'socials': p.get('info', {}).get('websites', []),
+                            'chain': 'SOL' if chain_id == 'solana' else (chain_id.upper() if chain_id in ['bsc','base'] else 'SOL')
+                        }
+                        self.seen_mints.add(mint)
+                        new_pools.append(pool)
+            except Exception as e:
+                print(f"DexScreener search error: {e}")
 
         if len(self.seen_mints) > self.max_mints:
             self.seen_mints = set(list(self.seen_mints)[-self.max_mints:])
@@ -241,7 +303,7 @@ class Detector:
         return all_prices
 
 # ============================================================================
-# 4. Filter Engine
+# 4. Filter Engine with advanced scoring
 # ============================================================================
 class FilterEngine:
     def __init__(self, config):
@@ -263,61 +325,123 @@ class FilterEngine:
         if self.config['require_social'] and len(pool['socials']) == 0:
             return None
 
-        score = 0
-        liq_score = min(100, pool['liquidity'] / 5000 * 100)
-        score += liq_score * 0.3
-        vol_score = min(100, pool.get('volume_5m', 0) / 500 * 100)
-        score += vol_score * 0.4
+        # Rug filter: volume/liquidity ratio (5m vol * 288 = 24h volume, compare to liq)
+        vol_liq_ratio = (pool.get('volume_5m', 0) * 288) / max(pool['liquidity'], 1)
+        if vol_liq_ratio > 50:
+            return None
+
+        # Score components
+        liq_score = min(100, pool['liquidity'] / 5000 * 100) * 0.3
+        vol_score = min(100, pool.get('volume_5m', 0) / 500 * 100) * 0.4
         social_score = min(30, len(pool['socials']) * 15)
-        score += social_score
-        pool['score'] = score
+
+        # Momentum
+        momentum = pool.get('price_change_5m', 0)
+        if momentum > 10:
+            momentum_score = 20
+        elif momentum > 5:
+            momentum_score = 10
+        elif momentum < -5:
+            momentum_score = -15
+        else:
+            momentum_score = 0
+
+        # Transaction count
+        buys_5m = pool.get('buys_5m', 0)
+        tx_score = min(20, buys_5m / 10)
+
+        total_score = liq_score + vol_score + social_score + momentum_score + tx_score
+        pool['score'] = total_score
         return pool
 
 # ============================================================================
-# 5. Trade Simulator
+# 5. Trade Simulator with tiered exits, trailing stop, partial sells
 # ============================================================================
 class TradeSimulator:
-    def __init__(self, initial_balance=100.0, buy_amount=1.0, profit_target_pct=15.0,
-                 profit_target_abs=0.75, timeout_min=10, stop_loss_pct=20.0):
+    def __init__(self, notifier, initial_balance=100.0, buy_amount=1.0,
+                 profit_target_pct=15.0, profit_target_abs=0.75,
+                 timeout_min=10, stop_loss_pct=10.0):
+        self.notifier = notifier
         self.balance = initial_balance
         self.initial_balance = initial_balance
         self.positions = {}
         self.trades = []
         self.buy_amount = buy_amount
-        self.profit_target_pct = profit_target_pct
-        self.profit_target_abs = profit_target_abs
-        self.timeout_min = timeout_min
-        self.stop_loss_pct = stop_loss_pct
+        self.base_profit_target_pct = profit_target_pct
+        self.base_profit_target_abs = profit_target_abs
+        self.base_timeout_min = timeout_min
+        self.base_stop_loss_pct = stop_loss_pct
 
-    def can_buy(self, max_positions=10):
-        return self.balance >= self.buy_amount and len(self.positions) < max_positions
+    def _get_targets(self, score):
+        """Return profit target, absolute target, stop loss, timeout based on entry score."""
+        if score >= 80:
+            return {'profit_pct': 60.0, 'profit_abs': 2.0, 'stop_pct': 15.0, 'timeout': 20}
+        elif score >= 65:
+            return {'profit_pct': 30.0, 'profit_abs': 1.0, 'stop_pct': 12.0, 'timeout': 15}
+        else:
+            return {'profit_pct': self.base_profit_target_pct,
+                    'profit_abs': self.base_profit_target_abs,
+                    'stop_pct': self.base_stop_loss_pct,
+                    'timeout': self.base_timeout_min}
+
+    def can_buy(self, max_positions=10, score=0):
+        """Check if we can open a new position, considering scaled buy amount."""
+        required = self.get_buy_amount(score)
+        # Cap at available balance
+        effective = min(required, self.balance)
+        return effective >= 0.5 and len(self.positions) < max_positions
+
+    def get_buy_amount(self, score):
+        """Scale buy amount by conviction."""
+        if score >= 80:
+            return self.buy_amount * 2.0
+        elif score >= 65:
+            return self.buy_amount * 1.5
+        else:
+            return self.buy_amount
 
     def simulate_buy(self, pool, max_pos=10):
-        if not self.can_buy(max_pos):
+        # Guard against buying when limit reached
+        score = pool.get('score', 50)
+        if not self.can_buy(max_pos, score):
             return None
+
+        amount_usd = self.get_buy_amount(score)
+        # Ensure we don't exceed balance
+        if amount_usd > self.balance:
+            amount_usd = self.balance
+        if amount_usd < 0.5:
+            return None
+
         price = pool['price']
         if price <= 0:
             return None
+
         slippage = random.uniform(0.5, 1.0) / 100
         effective_price = price * (1 + slippage)
-        amount_usd = min(self.buy_amount, self.balance)
         fee = amount_usd * 0.005
         amount_after_fee = amount_usd - fee
         quantity = amount_after_fee / effective_price
         self.balance -= amount_usd
+
+        targets = self._get_targets(score)
         self.positions[pool['mint']] = {
             'symbol': pool['symbol'],
             'buy_price': effective_price,
             'buy_time': datetime.datetime.now(),
             'amount_usd': amount_usd,
             'quantity': quantity,
-            'target_price': effective_price * (1 + self.profit_target_pct/100),
-            'target_profit_usd': self.profit_target_abs,
-            'stop_price': effective_price * (1 - self.stop_loss_pct/100),
-            'timeout_at': datetime.datetime.now() + datetime.timedelta(minutes=self.timeout_min),
+            'target_price': effective_price * (1 + targets['profit_pct'] / 100),
+            'target_profit_usd': targets['profit_abs'],
+            'stop_price': effective_price * (1 - targets['stop_pct'] / 100),
+            'timeout_at': datetime.datetime.now() + datetime.timedelta(minutes=targets['timeout']),
             'last_price_update': datetime.datetime.now(),
-            'chain': pool.get('chain', 'SOL')
+            'chain': pool.get('chain', 'SOL'),
+            'entry_score': score,
+            'partial_sold': False,
+            'targets': targets
         }
+
         return {
             'symbol': pool['symbol'],
             'price': effective_price,
@@ -332,39 +456,90 @@ class TradeSimulator:
             self.positions[mint]['current_price'] = current_price
             self.positions[mint]['last_price_update'] = datetime.datetime.now()
 
-    def _execute_sell(self, mint, pos, price, reason):
+    def update_trailing_stop(self, mint):
+        """Ratchet stop loss up as price rises (only for high-score coins)."""
+        if mint not in self.positions:
+            return
+        pos = self.positions[mint]
+        price = pos.get('current_price')
+        if not price:
+            return
+        # Only apply trailing stop to coins with score >= 65
+        if pos.get('entry_score', 0) < 65:
+            return
+        # Use stop percentage from targets
+        stop_pct = pos['targets']['stop_pct'] / 100
+        new_stop = price * (1 - stop_pct)
+        if new_stop > pos['stop_price']:
+            self.positions[mint]['stop_price'] = new_stop
+
+    def _execute_sell(self, mint, pos, price, reason, partial=False):
         slippage = random.uniform(0.5, 1.0) / 100
         effective_sell_price = price * (1 - slippage)
         fee = (effective_sell_price * pos['quantity']) * 0.005
         net_proceeds = effective_sell_price * pos['quantity'] - fee
         self.balance += net_proceeds
         profit = net_proceeds - pos['amount_usd']
+        profit_pct = ((net_proceeds / pos['amount_usd']) - 1) * 100
+
         trade_record = {
             'timestamp': datetime.datetime.now(),
             'symbol': pos['symbol'],
+            'mint': mint,
             'buy_price': pos['buy_price'],
             'sell_price': effective_sell_price,
             'buy_amount_usd': pos['amount_usd'],
             'sell_amount_usd': net_proceeds,
             'profit_usd': profit,
-            'reason': reason
+            'reason': reason,
+            'entry_score': pos.get('entry_score', 0),
+            'chain': pos.get('chain', 'SOL'),
+            'partial': partial
         }
         self.trades.append(trade_record)
-        del self.positions[mint]
-        return {'symbol': pos['symbol'], 'profit': profit, 'reason': reason}
+
+        # Update state based on partial flag
+        if partial:
+            # Mark the position as partially sold (if not already)
+            self.positions[mint]['partial_sold'] = True
+        else:
+            # Full sell – remove position
+            del self.positions[mint]
+
+        # Send Telegram trade log
+        emoji = "✅ WIN" if profit > 0 else "❌ LOSS"
+        msg = (
+            f"{emoji} TRADE CLOSED\n"
+            f"🪙 {pos['symbol']} [{pos.get('chain','SOL')}]\n"
+            f"📋 CA: <code>{mint}</code>\n"
+            f"📥 Buy:  ${pos['buy_price']:.8f}\n"
+            f"📤 Sell: ${effective_sell_price:.8f}\n"
+            f"📊 P&L:  ${profit:+.2f} ({profit_pct:+.1f}%)\n"
+            f"🎯 Score at entry: {pos.get('entry_score', 0):.0f}\n"
+            f"💼 Balance now: ${self.balance:.2f}\n"
+            f"📝 Reason: {reason}"
+        )
+        if partial:
+            msg = msg.replace("TRADE CLOSED", "PARTIAL SELL") + "\n⚡ 50% closed, remaining hold"
+        self.notifier.send(msg)
+
+        return {'symbol': pos['symbol'], 'profit': profit, 'reason': reason, 'partial': partial}
 
     def check_positions(self):
         executed_sells = []
         now = datetime.datetime.now()
         stale_threshold = datetime.timedelta(minutes=5)
 
+        # Use snapshot to avoid RuntimeError if positions change during iteration
         for mint, pos in list(self.positions.items()):
+            # Timeout takes priority, even if price is stale
             if now >= pos['timeout_at']:
                 price = pos.get('current_price', pos['buy_price'])
-                result = self._execute_sell(mint, pos, price, f"timeout after {self.timeout_min} min")
+                result = self._execute_sell(mint, pos, price, f"timeout after {pos['targets']['timeout']} min")
                 executed_sells.append(result)
                 continue
 
+            # For price-based exits, skip if price is stale
             price = pos.get('current_price')
             if price is None or now - pos.get('last_price_update', now) > stale_threshold:
                 continue
@@ -373,12 +548,38 @@ class TradeSimulator:
             profit_usd = current_value - pos['amount_usd']
             profit_pct = (current_value / pos['amount_usd'] - 1) * 100
             reason = None
-            if profit_usd >= self.profit_target_abs:
-                reason = f"absolute profit ${profit_usd:.2f} >= target ${self.profit_target_abs}"
-            elif profit_pct >= self.profit_target_pct:
-                reason = f"profit {profit_pct:.1f}% >= target {self.profit_target_pct}%"
+
+            # Partial sell for high-score coins (score >= 80)
+            score = pos.get('entry_score', 0)
+            if score >= 80 and not pos.get('partial_sold') and profit_pct >= 30:
+                # Halve the position before selling half
+                half_qty = pos['quantity'] / 2
+                half_cost = pos['amount_usd'] / 2
+
+                # Create a copy for the half being sold
+                half_pos = pos.copy()
+                half_pos['quantity'] = half_qty
+                half_pos['amount_usd'] = half_cost
+
+                # Update the original position (remaining half)
+                self.positions[mint]['quantity'] = half_qty
+                self.positions[mint]['amount_usd'] = half_cost
+                self.positions[mint]['partial_sold'] = True
+                self.positions[mint]['stop_price'] = pos['buy_price']  # move stop to breakeven
+
+                # Sell the half
+                result = self._execute_sell(mint, half_pos, price, "partial sell at +30%", partial=True)
+                executed_sells.append(result)
+                continue
+
+            # Check full sell conditions using tiered targets
+            if profit_usd >= pos['target_profit_usd']:
+                reason = f"absolute profit ${profit_usd:.2f} >= target ${pos['target_profit_usd']}"
+            elif profit_pct >= pos['targets']['profit_pct']:
+                reason = f"profit {profit_pct:.1f}% >= target {pos['targets']['profit_pct']}%"
             elif price <= pos['stop_price']:
-                reason = f"stop loss at {self.stop_loss_pct}%"
+                reason = f"stop loss at {pos['targets']['stop_pct']}%"
+
             if reason:
                 result = self._execute_sell(mint, pos, price, reason)
                 executed_sells.append(result)
@@ -386,7 +587,7 @@ class TradeSimulator:
         return executed_sells
 
 # ============================================================================
-# 6. Reporter (logs and saves state)
+# 6. Reporter (logs and saves state) with win rate tracking
 # ============================================================================
 class Reporter:
     def __init__(self, telegram_notifier):
@@ -395,21 +596,19 @@ class Reporter:
         self.last_save = datetime.datetime.now()
         self.initial_balance = 100.0
         self.start_time = datetime.datetime.now()
-        self.warned_live = False
-        self.last_summary_date = None
+        self.consecutive_losses = 0
 
     def log_detection(self, pool):
-        msg = f"🔍 New coin detected [{pool['chain']}] {pool['symbol']} ({pool['name']}) | Mint: {pool['mint'][:8]}... | Score: {pool.get('score',0):.1f} | Liq: ${pool['liquidity']:,.0f}"
-        print(msg)
-        self.telegram.send(msg)
+        """Console log only (no Telegram)."""
+        print(f"🔍 [{pool['chain']}] {pool['symbol']} ({pool['name']}) | Score: {pool.get('score',0):.1f} | Liq: ${pool['liquidity']:,.0f}")
 
     def log_buy(self, pool, buy_result):
-        msg = f"✅ SIMULATED BUY [{pool['chain']}] {pool['symbol']} @ ${buy_result['price']:.8f} | Amount: ${buy_result['amount']:.2f} | Fee: ${buy_result['fee']:.2f} | Balance: ${buy_result['balance_after']:.2f}"
-        print(msg)
-        self.telegram.send(msg)
-
-    def log_sell(self, symbol, profit, reason):
-        msg = f"💰 SIMULATED SELL {symbol} | Profit: ${profit:.2f} | Reason: {reason}"
+        msg = (
+            f"✅ SIMULATED BUY [{pool['chain']}] {pool['symbol']}\n"
+            f"📋 CA: <code>{pool['mint']}</code>\n"
+            f"Price: ${buy_result['price']:.8f} | Amount: ${buy_result['amount']:.2f}\n"
+            f"Fee: ${buy_result['fee']:.2f} | Balance: ${buy_result['balance_after']:.2f}"
+        )
         print(msg)
         self.telegram.send(msg)
 
@@ -435,7 +634,8 @@ class Reporter:
                 'seen_mints': list(detector.seen_mints)
             },
             'daily_summary': self.daily_summary,
-            'start_time': self.start_time.isoformat()
+            'start_time': self.start_time.isoformat(),
+            'consecutive_losses': self.consecutive_losses
         }
         with open(DATA_PATH / "state.pkl", 'wb') as f:
             pickle.dump(state, f)
@@ -451,6 +651,8 @@ class Reporter:
             self.daily_summary = state['daily_summary']
             if 'start_time' in state:
                 self.start_time = datetime.datetime.fromisoformat(state['start_time'])
+            if 'consecutive_losses' in state:
+                self.consecutive_losses = state['consecutive_losses']
             print("Loaded previous state.")
         except FileNotFoundError:
             print("No previous state found, starting fresh.")
@@ -471,12 +673,15 @@ class Reporter:
         self.daily_summary['trades'] += 1
         if trade_profit > 0:
             self.daily_summary['wins'] += 1
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
         self.daily_summary['net_profit'] += trade_profit
 
-    def plot_equity(self):
-        if not self.trades:
+    def plot_equity(self, trades):
+        if not trades:
             return
-        df = pd.DataFrame(self.trades)
+        df = pd.DataFrame(trades)
         df['cumulative'] = df['profit_usd'].cumsum() + self.initial_balance
         plt.figure(figsize=(12,4))
         plt.plot(df['timestamp'], df['cumulative'], label='Equity')
@@ -508,6 +713,7 @@ def run_bot():
     reporter = Reporter(notifier)
     detector = Detector()
     simulator = TradeSimulator(
+        notifier=notifier,
         initial_balance=100.0,
         buy_amount=BUY_AMOUNT,
         profit_target_pct=PROFIT_TARGET_PCT,
@@ -516,7 +722,6 @@ def run_bot():
         stop_loss_pct=STOP_LOSS_PCT
     )
     reporter.initial_balance = simulator.initial_balance
-    reporter.trades = simulator.trades  # link for plotting
 
     reporter.load_state(simulator, detector)
 
@@ -538,8 +743,11 @@ def run_bot():
     }
     filter_engine = FilterEngine(filter_config)
 
+    # Circuit breaker: time until buys are allowed again
+    buy_pause_until = None
+
     while True:
-        # 48-hour timer (if set)
+        # Max run time check
         if MAX_RUN_HOURS > 0:
             elapsed = datetime.datetime.now() - start_time
             if elapsed.total_seconds() > MAX_RUN_HOURS * 3600:
@@ -562,22 +770,52 @@ def run_bot():
             time.sleep(30)
             continue
 
-        for pool in new_pools:
-            filtered = filter_engine.filter_and_score(pool)
-            if filtered and filtered['score'] >= SCORE_THRESHOLD:
-                reporter.log_detection(filtered)
-                notifier.send(f"📈 BUY SIGNAL [{filtered['chain']}] {filtered['symbol']} | Score: {filtered['score']:.1f} | Liq: ${filtered['liquidity']:,.0f}")
-                if simulator.can_buy(MAX_POSITIONS):
-                    buy_result = simulator.simulate_buy(filtered, MAX_POSITIONS)
-                    if buy_result:
-                        reporter.log_buy(filtered, buy_result)
-                    else:
-                        reporter.log_error(f"Insufficient balance to buy {filtered['symbol']}")
-                else:
-                    print(f"Skipping {filtered['symbol']} — max positions ({MAX_POSITIONS}) reached")
+        # Daily loss limit check before buying
+        daily_loss = reporter.daily_summary.get('net_profit', 0)
+        if daily_loss < DAILY_LOSS_LIMIT:
+            print(f"⛔ Daily loss limit hit (${daily_loss:.2f}) — no new buys until tomorrow")
+        # Consecutive loss circuit breaker (non-blocking)
+        elif reporter.consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
+            if buy_pause_until is None:
+                print(f"⛔ {reporter.consecutive_losses} consecutive losses — pausing buys for 30 min")
+                buy_pause_until = datetime.datetime.now() + datetime.timedelta(minutes=30)
+                reporter.consecutive_losses = 0
+                reporter.save_state(simulator, detector)
+            # Do not block the loop; just skip buys while paused
+        else:
+            # No pause active, proceed with buying
+            # Check if pause is active and expired
+            if buy_pause_until and datetime.datetime.now() >= buy_pause_until:
+                buy_pause_until = None
+                print("▶️ Buy pause lifted")
+            if buy_pause_until is None:
+                for pool in new_pools:
+                    filtered = filter_engine.filter_and_score(pool)
+                    if filtered and filtered['score'] >= SCORE_THRESHOLD:
+                        # Console log only (no Telegram)
+                        reporter.log_detection(filtered)
+                        # Send buy signal (Telegram) with full details
+                        notifier.send(
+                            f"📈 BUY SIGNAL [{filtered['chain']}] {filtered['symbol']} ({filtered['name']})\n"
+                            f"📋 CA: <code>{filtered['mint']}</code>\n"
+                            f"Score: {filtered['score']:.1f} | Liq: ${filtered['liquidity']:,.0f}"
+                        )
+                        if simulator.can_buy(MAX_POSITIONS, filtered.get('score', 0)):
+                            buy_result = simulator.simulate_buy(filtered, MAX_POSITIONS)
+                            if buy_result:
+                                reporter.log_buy(filtered, buy_result)
+                            else:
+                                reporter.log_error(f"Insufficient balance to buy {filtered['symbol']}")
+                        else:
+                            print(f"Skipping {filtered['symbol']} — max positions ({MAX_POSITIONS}) reached")
+            else:
+                # Still paused, print reminder occasionally
+                remaining = buy_pause_until - datetime.datetime.now()
+                if remaining.total_seconds() % 60 < 15:  # print roughly once per minute
+                    print(f"⏸ Buy pause active for {int(remaining.total_seconds()//60)} min")
 
-        # Update prices for open positions
-        active_positions = simulator.positions.items()
+        # Update prices for open positions – use snapshot to avoid iteration issues
+        active_positions = list(simulator.positions.items())
         if active_positions:
             positions_by_chain = {}
             for mint, pos in active_positions:
@@ -588,12 +826,14 @@ def run_bot():
                 price_data = detector.fetch_prices_batch(mints, chain)
                 for mint, data in price_data.items():
                     simulator.update_price(mint, data['price'])
+                    simulator.update_trailing_stop(mint)   # trailing stop update
 
         # Check for sells
         sells = simulator.check_positions()
         for sell in sells:
-            reporter.log_sell(sell['symbol'], sell['profit'], sell['reason'])
-            reporter.update_daily_summary(sell['profit'])
+            # Only full trades affect daily stats (partial sells are not counted in win rate / daily summary)
+            if not sell.get('partial'):
+                reporter.update_daily_summary(sell['profit'])
 
         # Periodic portfolio update
         if (datetime.datetime.now() - last_portfolio_update).total_seconds() > 300:
@@ -603,12 +843,16 @@ def run_bot():
         # Auto save state
         reporter.auto_save(simulator, detector)
 
-        # Status log
-        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Balance: ${simulator.balance:.2f} | Trades: {len(simulator.trades)} | Open: {len(simulator.positions)}")
+        # Status line with win rate (excluding partial trades)
+        full_trades = [t for t in simulator.trades if not t.get('partial')]
+        total_trades = len(full_trades)
+        wins = sum(1 for t in full_trades if t['profit_usd'] > 0)
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Balance: ${simulator.balance:.2f} | Trades: {total_trades} | WR: {win_rate:.0f}% | Open: {len(simulator.positions)}")
         time.sleep(15)
 
     # Final plot and exit
-    reporter.plot_equity()
+    reporter.plot_equity(simulator.trades)
 
 # ============================================================================
 # 9. Start
