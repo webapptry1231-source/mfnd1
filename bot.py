@@ -229,7 +229,7 @@ class Detector:
                     continue
             print(f"[DETECT] pump.fun: fetched={pf_fetched} new={pf_new} already_seen={pf_skipped}")
 
-        # 2. Four.meme (BSC) — with BNB price conversion
+                # 2. Four.meme (BSC) — with BNB price conversion
         if selected_chain in ['BSC', 'ALL']:
             if now - self.last_fourmeme_fetch > 15:
                 self.last_fourmeme_fetch = now
@@ -238,38 +238,42 @@ class Detector:
                     if resp and resp.status_code == 200 and resp.text.strip():
                         result = resp.json()
                         items = (result.get('data') or {}).get('list') or result.get('list') or []
-                        if not items:
-                            continue
-                        with BNB_LOCK:
-                            bnb_usd = BNB_USD
-                        for coin in items:
-                            mint = coin.get('tokenAddress') or coin.get('address')
-                            if not mint or mint in self.seen_mints:
-                                continue
-                            liq = float(coin.get('liquidity', 0) or 0)
-                            if liq == 0:
-                                continue
-                            ts = coin.get('createTime', now * 1000)
-                            created_at = datetime.datetime.fromtimestamp(ts / 1000)
-                            age_sec = max((now * 1000 - ts) / 1000, 60)
-                            vol_usd  = float(coin.get('volume', 0) or 0) * bnb_usd
-                            vol_5m   = (vol_usd / age_sec) * 300
-                            pool = {
-                                'mint':            mint,
-                                'symbol':          coin.get('symbol', '???'),
-                                'name':            coin.get('name', '???'),
-                                'price':           float(coin.get('price', 0)) * bnb_usd,
-                                'liquidity':       liq * bnb_usd,
-                                'volume_5m':       vol_5m,
-                                'created_at':      created_at,
-                                'socials':         self._normalize_socials([coin.get('twitter'), coin.get('telegram')]),
-                                'chain':           'BSC',
-                                'price_change_5m': 0,
-                                'buys_5m':         0,
-                                'source':          'fourmeme'
-                            }
-                            self.seen_mints.add(mint)
-                            new_pools.append(pool)
+                        
+                        # FIX: Check if items exist before proceeding, instead of using 'continue'
+                        if items:
+                            with BNB_LOCK:
+                                bnb_usd = BNB_USD
+                                
+                            for coin in items:
+                                mint = coin.get('tokenAddress') or coin.get('address')
+                                if not mint or mint in self.seen_mints:
+                                    continue # This 'continue' is perfectly fine because it's inside a 'for' loop
+                                
+                                liq = float(coin.get('liquidity', 0) or 0)
+                                if liq == 0:
+                                    continue
+                                
+                                ts = coin.get('createTime', now * 1000)
+                                created_at = datetime.datetime.fromtimestamp(ts / 1000)
+                                age_sec = max((now * 1000 - ts) / 1000, 60)
+                                vol_usd  = float(coin.get('volume', 0) or 0) * bnb_usd
+                                vol_5m   = (vol_usd / age_sec) * 300
+                                pool = {
+                                    'mint':            mint,
+                                    'symbol':          coin.get('symbol', '???'),
+                                    'name':            coin.get('name', '???'),
+                                    'price':           float(coin.get('price', 0)) * bnb_usd,
+                                    'liquidity':       liq * bnb_usd,
+                                    'volume_5m':       vol_5m,
+                                    'created_at':      created_at,
+                                    'socials':         self._normalize_socials([coin.get('twitter'), coin.get('telegram')]),
+                                    'chain':           'BSC',
+                                    'price_change_5m': 0,
+                                    'buys_5m':         0,
+                                    'source':          'fourmeme'
+                                }
+                                self.seen_mints.add(mint)
+                                new_pools.append(pool)
                 except Exception as e:
                     print(f"Four.meme error: {e}")
 
