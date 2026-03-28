@@ -49,8 +49,8 @@ class BotConfig:
     chain_selector: str = os.getenv("CHAIN_SELECTOR", "ALL")
     daily_loss_limit: float = float(os.getenv("DAILY_LOSS_LIMIT", "-15"))
     consecutive_loss_limit: int = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
-    min_buys_5m: int = int(os.getenv("MIN_BUYS_5M", "5"))          # raised from 0
-    min_buy_usd: float = float(os.getenv("MIN_BUY_USD", "5.0"))    # NEW
+    min_buys_5m: int = int(os.getenv("MIN_BUYS_5M", "5"))
+    min_buy_usd: float = float(os.getenv("MIN_BUY_USD", "5.0"))
 
     # Momentum scanner
     age_momentum_min: int = int(os.getenv("AGE_MOMENTUM_MIN", "900"))
@@ -58,7 +58,7 @@ class BotConfig:
     volume_spike_mult: float = float(os.getenv("VOLUME_SPIKE_MULT", "2.0"))
     momentum_score_threshold: int = int(os.getenv("MOMENTUM_SCORE_THRESHOLD", "35"))
     min_buy_ratio: float = float(os.getenv("MIN_BUY_RATIO", "0.65"))
-    birdeye_api_key: str = os.getenv("BIRDEYE_API_KEY", "")       # from Railway
+    birdeye_api_key: str = os.getenv("BIRDEYE_API_KEY", "")
 
 config = BotConfig()
 
@@ -128,11 +128,11 @@ class TelegramNotifier:
 # ============================================================================
 class Detector:
     def __init__(self, max_mints=25000):
-        self.seen_mints = set()                    # global fallback
-        self.seen_mints_per_chain = defaultdict(set)  # per-chain precision
+        self.seen_mints = set()
+        self.seen_mints_per_chain = defaultdict(set)
         self.max_mints = max_mints
         self.last_profile_fetch = 0
-        self.last_search_fetch = {}                # per-chain
+        self.last_search_fetch = {}
         self.last_fourmeme_fetch = 0
         self.last_clanker_fetch = 0
 
@@ -201,7 +201,16 @@ class Detector:
         # 1. Pump.fun (SOL only)
         if selected_chain in ['SOL', 'ALL']:
             for pf_url in self.pump_fun_urls:
-                resp = self._get_with_backoff(pf_url)
+                # Pump.fun requires its own headers
+                pf_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json, text/plain, */*",
+                    "Origin": "https://pump.fun",
+                    "Referer": "https://pump.fun/",
+                    "Sec-Fetch-Site": "same-site",
+                    "Sec-Fetch-Mode": "cors"
+                }
+                resp = self._get_with_backoff(pf_url, extra_headers=pf_headers)
                 if not resp or not resp.text.strip():
                     continue
                 try:
@@ -393,7 +402,7 @@ class Detector:
         momentum_pools = []
         now = time.time()
 
-        # 1. Birdeye trending (SOL only - uses free tier API key)
+        # 1. Birdeye trending (SOL only)
         if config.birdeye_api_key and selected_chain in ['SOL', 'ALL']:
             try:
                 url = "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=desc&offset=0&limit=50"
@@ -443,7 +452,7 @@ class Detector:
             except Exception as e:
                 logger.warning(f"Birdeye momentum error: {e}")
 
-        # 2. DexScreener fallback (per‑chain)
+        # 2. DexScreener fallback (per-chain)
         try:
             chains_to_scan = ['SOL'] if selected_chain == 'SOL' else \
                              ['BSC'] if selected_chain == 'BSC' else \
@@ -863,9 +872,6 @@ def keep_alive():
     while True:
         time.sleep(300)  # every 5 min
         logger.info("[HEALTH] Bot is alive")
-        # Uncomment to send Telegram health ping (requires notifier reference)
-        # if notifier:
-        #     notifier.send("✅ Bot is alive")
 threading.Thread(target=keep_alive, daemon=True).start()
 
 # ============================================================================
