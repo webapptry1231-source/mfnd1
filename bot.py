@@ -15,7 +15,7 @@ from pathlib import Path
 # 0. Environment Configuration
 # ============================================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8375248570")
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     print("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
     sys.exit(1)
