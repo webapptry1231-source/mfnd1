@@ -41,7 +41,7 @@ class BotConfig:
     timeout_min: int            = int(os.getenv("TIMEOUT_MIN", "10"))
     stop_loss_pct: float        = float(os.getenv("STOP_LOSS_PCT", "10.0"))
     max_positions: int          = int(os.getenv("MAX_POSITIONS", "10"))
-    score_threshold: int        = int(os.getenv("SCORE_THRESHOLD", "20"))
+    score_threshold: int        = int(os.getenv("SCORE_THRESHOLD", "45"))
     max_run_hours: int          = int(os.getenv("MAX_RUN_HOURS", "48"))
     age_min: int                = int(os.getenv("AGE_MIN", "10"))
     age_max: int                = int(os.getenv("AGE_MAX", "900"))
