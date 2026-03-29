@@ -49,8 +49,8 @@ class BotConfig:
     chain_selector: str = os.getenv("CHAIN_SELECTOR", "ALL")
     daily_loss_limit: float = float(os.getenv("DAILY_LOSS_LIMIT", "-15"))
     consecutive_loss_limit: int = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
-    min_buys_5m: int = int(os.getenv("MIN_BUYS_5M", "5"))
-    min_buy_usd: float = float(os.getenv("MIN_BUY_USD", "5.0"))
+    min_buys_5m: int = int(os.getenv("MIN_BUYS_5M", "0"))
+    min_buy_usd: float = float(os.getenv("MIN_BUY_USD", "0.5"))
 
     # Momentum scanner
     age_momentum_min: int = int(os.getenv("AGE_MOMENTUM_MIN", "900"))
@@ -127,13 +127,16 @@ class TelegramNotifier:
 # 3. Detector (New Launches + Momentum)
 # ============================================================================
 class Detector:
-    def __init__(self, max_mints=25000):
+    def __init__(self, max_mints=25000, max_per_chain=15000):
         self.seen_mints = set()
         self.seen_mints_per_chain = defaultdict(set)
         self.max_mints = max_mints
+        self.max_per_chain = max_per_chain
         self.last_profile_fetch = 0
         self.last_search_fetch = {}
+        self.last_momentum_fetch = {}
         self.last_clanker_fetch = 0
+        self.last_fourmeme_fetch = 0
 
         self.pump_fun_urls = [
             "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC",
@@ -151,9 +154,15 @@ class Detector:
             'BSC': "https://api.dexscreener.com/latest/dex/search?q=four.meme",
             'BASE': "https://api.dexscreener.com/latest/dex/search?q=zora+base"
         }
+        self.momentum_urls = {
+            'SOL': "https://api.dexscreener.com/latest/dex/search?q=solana+trending",
+            'BSC': "https://api.dexscreener.com/latest/dex/search?q=bsc+trending",
+            'BASE': "https://api.dexscreener.com/latest/dex/search?q=base+trending"
+        }
         self.clanker_search_url = "https://api.dexscreener.com/latest/dex/search?q=clanker"
+        self.fourmeme_url = "https://four.meme/meme-api/v1/meme/query?page=1&pageSize=50&sort=createTime&order=desc&status=1"
 
-    # ---- Exponential backoff with custom headers and debug logging ----
+    # ---- Exponential backoff ----
     def _get_with_backoff(self, url, max_retries=4, extra_headers=None):
         wait = 2
         for attempt in range(max_retries):
@@ -169,7 +178,6 @@ class Detector:
                     continue
                 if resp.status_code == 200:
                     return resp
-                # Log any non-200 status
                 logger.warning(f"HTTP {resp.status_code} on {url}")
                 return None
             except Exception as e:
@@ -192,11 +200,19 @@ class Detector:
                     result.append(url)
         return result
 
+    # ---- Trims per‑chain seen sets ----
+    def _trim_per_chain(self):
+        for chain in list(self.seen_mints_per_chain.keys()):
+            if len(self.seen_mints_per_chain[chain]) > self.max_per_chain:
+                self.seen_mints_per_chain[chain] = set(
+                    list(self.seen_mints_per_chain[chain])[-self.max_per_chain:]
+                )
+
     # ==================== NEW LAUNCH SCANNER ====================
     def get_new_pools(self, selected_chain):
         new_pools = []
         now = time.time()
-        pump_new = 0   # track pump.fun new coins separately for logging
+        pump_new = 0
 
         # 1. Pump.fun (SOL only)
         if selected_chain in ['SOL', 'ALL']:
@@ -245,49 +261,99 @@ class Detector:
                 except Exception as e:
                     logger.error(f"Pump.fun error: {e}")
 
-        # 2. Clanker (BASE) via DexScreener search
+        # 2. Four.meme (BSC) – restored with BNB conversion
+        if selected_chain in ['BSC', 'ALL'] and now - self.last_fourmeme_fetch > 30:
+            self.last_fourmeme_fetch = now
+            resp = self._get_with_backoff(self.fourmeme_url)
+            if resp and resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    items = data.get('data', {}).get('list', []) if isinstance(data, dict) else []
+                    with BNB_LOCK:
+                        bnb_usd = BNB_USD
+                    four_new = 0
+                    for item in items:
+                        mint = item.get('tokenAddress') or item.get('address')
+                        if not mint or mint in self.seen_mints_per_chain['BSC']:
+                            continue
+                        liq = float(item.get('liquidity', 0) or 0)
+                        if liq == 0:
+                            continue
+                        ts = item.get('createTime', now * 1000)
+                        created_at = datetime.datetime.fromtimestamp(ts / 1000)
+                        age_sec = max((now * 1000 - ts) / 1000, 60)
+                        vol_usd = float(item.get('volume', 0) or 0) * bnb_usd
+                        vol_5m = (vol_usd / age_sec) * 300
+                        pool = {
+                            'mint': mint,
+                            'symbol': item.get('symbol', '???'),
+                            'name': item.get('name', '???'),
+                            'price': float(item.get('price', 0)) * bnb_usd,
+                            'liquidity': liq * bnb_usd,
+                            'volume_5m': vol_5m,
+                            'created_at': created_at,
+                            'socials': self._normalize_socials([item.get('twitter'), item.get('telegram')]),
+                            'chain': 'BSC',
+                            'price_change_5m': 0,
+                            'buys_5m': 0,
+                            'source': 'fourmeme'
+                        }
+                        self.seen_mints_per_chain['BSC'].add(mint)
+                        new_pools.append(pool)
+                        four_new += 1
+                    if four_new > 0:
+                        logger.info(f"[NEW] four.meme: {four_new} new")
+                except Exception as e:
+                    logger.error(f"Four.meme error: {e}")
+
+        # 3. Clanker (BASE) via DexScreener search
         if selected_chain in ['BASE', 'ALL'] and now - self.last_clanker_fetch > 60:
             self.last_clanker_fetch = now
             resp = self._get_with_backoff(self.clanker_search_url)
             if resp and resp.status_code == 200:
-                clanker_new = 0
-                for p in resp.json().get('pairs', []):
-                    if p.get('chainId') != 'base':
-                        continue
-                    mint = p.get('baseToken', {}).get('address')
-                    if not mint or mint in self.seen_mints_per_chain['BASE']:
-                        continue
-                    pool = {
-                        'mint': mint,
-                        'symbol': p.get('baseToken', {}).get('symbol', '???'),
-                        'name': p.get('baseToken', {}).get('name', '???'),
-                        'price': float(p.get('priceUsd', 0)),
-                        'liquidity': float(p.get('liquidity', {}).get('usd', 0)),
-                        'volume_5m': float(p.get('volume', {}).get('m5', 0)),
-                        'price_change_5m': float(p.get('priceChange', {}).get('m5', 0)),
-                        'buys_5m': p.get('txns', {}).get('m5', {}).get('buys', 0),
-                        'created_at': datetime.datetime.fromtimestamp(p.get('pairCreatedAt', now*1000) / 1000),
-                        'socials': self._normalize_socials(p.get('info', {}).get('websites', [])),
-                        'chain': 'BASE',
-                        'source': 'clanker'
-                    }
-                    self.seen_mints_per_chain['BASE'].add(mint)
-                    new_pools.append(pool)
-                    clanker_new += 1
-                if clanker_new > 0:
-                    logger.info(f"[NEW] clanker: {clanker_new} new")
-            elif resp:
-                # Already logged by _get_with_backoff
-                pass
+                try:
+                    data = resp.json()
+                    clanker_new = 0
+                    for p in data.get('pairs', []):
+                        if p.get('chainId') != 'base':
+                            continue
+                        mint = p.get('baseToken', {}).get('address')
+                        if not mint or mint in self.seen_mints_per_chain['BASE']:
+                            continue
+                        pool = {
+                            'mint': mint,
+                            'symbol': p.get('baseToken', {}).get('symbol', '???'),
+                            'name': p.get('baseToken', {}).get('name', '???'),
+                            'price': float(p.get('priceUsd', 0)),
+                            'liquidity': float(p.get('liquidity', {}).get('usd', 0)),
+                            'volume_5m': float(p.get('volume', {}).get('m5', 0)),
+                            'price_change_5m': float(p.get('priceChange', {}).get('m5', 0)),
+                            'buys_5m': p.get('txns', {}).get('m5', {}).get('buys', 0),
+                            'created_at': datetime.datetime.fromtimestamp(p.get('pairCreatedAt', now*1000) / 1000),
+                            'socials': self._normalize_socials(p.get('info', {}).get('websites', [])),
+                            'chain': 'BASE',
+                            'source': 'clanker'
+                        }
+                        self.seen_mints_per_chain['BASE'].add(mint)
+                        new_pools.append(pool)
+                        clanker_new += 1
+                    if clanker_new > 0:
+                        logger.info(f"[NEW] clanker: {clanker_new} new")
+                except Exception as e:
+                    logger.warning(f"Error parsing Clanker response: {e}")
 
-        # 3. DexScreener token profiles (every 60s)
+        # 4. DexScreener token profiles (every 60s)
         if now - self.last_profile_fetch > 60:
             self.last_profile_fetch = now
             ds_new = 0
             try:
                 resp = self._get_with_backoff(self.token_profile_url)
                 if resp and resp.status_code == 200:
-                    data = resp.json()
+                    try:
+                        data = resp.json()
+                    except Exception as e:
+                        logger.warning(f"Invalid JSON from token profiles: {e}")
+                        data = []
                     chain_label_map = {'solana': 'SOL', 'bsc': 'BSC', 'base': 'BASE'}
                     for item in data:
                         mint = item.get('tokenAddress')
@@ -317,12 +383,14 @@ class Detector:
                             self.seen_mints_per_chain[pool['chain']].add(mint)
                             new_pools.append(pool)
                             ds_new += 1
-                if ds_new > 0:
-                    logger.info(f"[NEW] dexscreener profiles: {ds_new} new")
+                    if ds_new > 0:
+                        logger.info(f"[NEW] dexscreener profiles: {ds_new} new")
+                elif resp:
+                    logger.warning(f"Token profiles returned {resp.status_code}")
             except Exception as e:
                 logger.error(f"DexScreener profiles error: {e}")
 
-        # 4. Chain-specific DexScreener search (per chain)
+        # 5. Chain-specific DexScreener search (per chain)
         chains_to_search = (['SOL', 'BSC', 'BASE'] if selected_chain == 'ALL' else [selected_chain])
         chain_label_map = {'solana': 'SOL', 'bsc': 'BSC', 'base': 'BASE'}
 
@@ -337,8 +405,13 @@ class Detector:
                 resp = self._get_with_backoff(url)
                 if not resp or resp.status_code != 200:
                     continue
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    logger.warning(f"Invalid JSON from search {sch}: {e}")
+                    continue
                 search_new = 0
-                for p in resp.json().get('pairs', []):
+                for p in data.get('pairs', []):
                     chain_id = p.get('chainId', '').lower()
                     chain_matches = (
                         (sch == 'SOL' and chain_id == 'solana') or
@@ -372,11 +445,12 @@ class Detector:
             except Exception as e:
                 logger.error(f"DexScreener search {sch} error: {e}")
 
-        # Cleanup: maintain global seen set for backward compatibility
+        # Cleanup
         for chain in self.seen_mints_per_chain:
             self.seen_mints.update(self.seen_mints_per_chain[chain])
         if len(self.seen_mints) > self.max_mints:
             self.seen_mints = set(list(self.seen_mints)[-self.max_mints:])
+        self._trim_per_chain()
         return new_pools
 
     # ==================== MOMENTUM SCANNER ====================
@@ -384,33 +458,49 @@ class Detector:
         momentum_pools = []
         now = time.time()
 
-        # 1. Birdeye trending (SOL only) – with detailed logging
+        # 1. Birdeye trending (SOL only) – improved `created_at` handling
         if config.birdeye_api_key and selected_chain in ['SOL', 'ALL']:
             try:
-                # Try the v1 endpoint (latest docs)
-                url = "https://public-api.birdeye.so/defi/v1/token_trending?sort_by=rank&sort_type=desc&offset=0&limit=50"
+                url = "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=desc&offset=0&limit=50"
                 extra_headers = {"X-API-KEY": config.birdeye_api_key, "x-chain": "solana"}
                 resp = self._get_with_backoff(url, extra_headers=extra_headers)
                 if resp and resp.status_code == 200:
-                    data = resp.json().get('data', {}).get('items', [])
-                    logger.info(f"[BIRDEYE] Retrieved {len(data)} trending tokens")
+                    try:
+                        data = resp.json()
+                        items = data.get('data', {}).get('tokens', [])
+                    except Exception as e:
+                        logger.warning(f"Birdeye JSON parse error: {e}")
+                        items = []
+                    logger.info(f"[BIRDEYE] Retrieved {len(items)} trending tokens")
                     birdeye_new = 0
-                    for item in data:
+                    for item in items:
                         mint = item.get('address')
                         if not mint or mint in self.seen_mints_per_chain['SOL']:
                             continue
-                        age_sec = now - (item.get('pairCreatedAt', now * 1000) / 1000)
-                        if not (config.age_momentum_min <= age_sec <= config.age_momentum_max):
-                            continue
-                        vol_5m = float(item.get('volume', {}).get('m5', 0) or 0)
-                        liq = float(item.get('liquidity', 0) or 0)
+
+                        # Use pairCreatedAt if available, otherwise fallback to age_momentum_min estimate
+                        pair_created = item.get('pairCreatedAt')
+                        if pair_created and isinstance(pair_created, (int, float)):
+                            created_at = datetime.datetime.fromtimestamp(pair_created / 1000)
+                            age_sec = now - (pair_created / 1000)
+                            # If age is outside momentum window, skip (but it's rare)
+                            if not (config.age_momentum_min <= age_sec <= config.age_momentum_max):
+                                continue
+                        else:
+                            # No creation time – assume the token is exactly `age_momentum_min` seconds old
+                            age_sec = config.age_momentum_min
+                            created_at = datetime.datetime.now() - datetime.timedelta(seconds=age_sec)
+
+                        # Estimate 5m volume from 24h volume (best we can do)
+                        vol_24h = float(item.get('volume24hUSD', 0))
+                        vol_5m = vol_24h / 288 if vol_24h > 0 else 0
+                        liq = float(item.get('liquidity', 0))
                         if vol_5m < config.volume_5m * config.volume_spike_mult or liq < config.liq_min:
                             continue
-                        buys = int(item.get('txns', {}).get('m5', {}).get('buys', 0) or 0)
-                        sells = int(item.get('txns', {}).get('m5', {}).get('sells', 0) or 0)
-                        buy_ratio = buys / (buys + sells + 1) if (buys + sells) > 0 else 0
-                        if buy_ratio < config.min_buy_ratio:
-                            continue
+
+                        # No transaction data – assume bullish
+                        buy_ratio = 1.0
+
                         pool = {
                             'mint': mint,
                             'symbol': item.get('symbol', '???'),
@@ -418,9 +508,9 @@ class Detector:
                             'price': float(item.get('price', 0)),
                             'liquidity': liq,
                             'volume_5m': vol_5m,
-                            'price_change_5m': float(item.get('priceChange', {}).get('m5', 0) or 0),
-                            'buys_5m': buys,
-                            'created_at': datetime.datetime.fromtimestamp(item.get('pairCreatedAt', now*1000) / 1000),
+                            'price_change_5m': float(item.get('priceChange24h', 0) or 0),
+                            'buys_5m': 0,
+                            'created_at': created_at,
                             'socials': self._normalize_socials(item.get('info', {}).get('websites', [])),
                             'chain': 'SOL',
                             'source': 'birdeye_momentum',
@@ -432,26 +522,36 @@ class Detector:
                     if birdeye_new > 0:
                         logger.info(f"[BIRDEYE] {birdeye_new} new momentum candidates")
                 elif resp:
-                    logger.warning(f"Birdeye returned {resp.status_code} for {url}")
+                    logger.warning(f"Birdeye returned {resp.status_code}")
             except Exception as e:
                 logger.warning(f"Birdeye momentum error: {e}")
 
-        # 2. DexScreener fallback (per-chain)
-        try:
-            chains_to_scan = ['SOL'] if selected_chain == 'SOL' else \
-                             ['BSC'] if selected_chain == 'BSC' else \
-                             ['BASE'] if selected_chain == 'BASE' else ['SOL', 'BSC', 'BASE']
-            for sch in chains_to_scan:
-                url = self.search_urls.get(sch)
-                if not url:
-                    continue
+        # 2. DexScreener dedicated momentum search (different queries, rate limited)
+        chains_to_scan = ['SOL'] if selected_chain == 'SOL' else \
+                         ['BSC'] if selected_chain == 'BSC' else \
+                         ['BASE'] if selected_chain == 'BASE' else ['SOL', 'BSC', 'BASE']
+        for sch in chains_to_scan:
+            if now - self.last_momentum_fetch.get(sch, 0) < 120:
+                continue
+            self.last_momentum_fetch[sch] = now
+            url = self.momentum_urls.get(sch)
+            if not url:
+                continue
+            try:
                 resp = self._get_with_backoff(url)
                 if not resp or resp.status_code != 200:
                     continue
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    logger.warning(f"Invalid JSON from momentum search {sch}: {e}")
+                    continue
                 ds_new = 0
-                for p in resp.json().get('pairs', []):
+                for p in data.get('pairs', []):
                     chain_id = p.get('chainId', '').lower()
-                    if selected_chain != 'ALL' and chain_id != {'SOL':'solana','BSC':'bsc','BASE':'base'}.get(sch):
+                    if (sch == 'SOL' and chain_id != 'solana') or \
+                       (sch == 'BSC' and chain_id != 'bsc') or \
+                       (sch == 'BASE' and chain_id != 'base'):
                         continue
                     mint = p.get('baseToken', {}).get('address')
                     if not mint or mint in self.seen_mints_per_chain[sch]:
@@ -487,14 +587,15 @@ class Detector:
                     ds_new += 1
                 if ds_new > 0:
                     logger.info(f"[MOMENTUM] DexScreener {sch}: {ds_new} new")
-        except Exception as e:
-            logger.error(f"DexScreener momentum error: {e}")
+            except Exception as e:
+                logger.error(f"DexScreener momentum error for {sch}: {e}")
 
-        # Sync global seen set
+        # Sync global seen set and trim
         for chain in self.seen_mints_per_chain:
             self.seen_mints.update(self.seen_mints_per_chain[chain])
         if len(self.seen_mints) > self.max_mints:
             self.seen_mints = set(list(self.seen_mints)[-self.max_mints:])
+        self._trim_per_chain()
 
         logger.info(f"[MOMENTUM] Found {len(momentum_pools)} momentum candidates")
         return momentum_pools
@@ -506,7 +607,10 @@ class Detector:
         resp = self._get_with_backoff(url, max_retries=3)
         if not resp or not resp.text.strip():
             return None
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception:
+            return None
         return data[0] if isinstance(data, list) and data else None
 
     def fetch_prices_batch(self, mints, chain):
@@ -522,7 +626,10 @@ class Detector:
                 if not resp or resp.status_code == 429:
                     time.sleep(60)
                     continue
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception:
+                    continue
                 for pair in (data if isinstance(data, list) else []):
                     mint = pair.get('baseToken', {}).get('address')
                     if mint:
@@ -539,15 +646,18 @@ class FilterEngine:
         self.config = config
 
     def filter_and_score(self, pool):
-        # Age filter – skip for real-time sources (pumpfun only now)
         source = pool.get('source', '')
-        if source != 'pumpfun':   # only pump.fun is the real-time source now
+        # Skip age and min_buys_5m for launchpads and momentum coins
+        skip_filters = (source in ('pumpfun', 'fourmeme') or source.endswith('_momentum'))
+        if not skip_filters:
             try:
                 age = (datetime.datetime.now() - pool['created_at']).total_seconds()
                 if age < self.config.age_min or age > self.config.age_max:
                     return None, f"age={age:.0f}s out of [{self.config.age_min},{self.config.age_max}]"
             except Exception as e:
                 return None, f"age_error={e}"
+            if self.config.min_buys_5m > 0 and pool.get('buys_5m', 0) < self.config.min_buys_5m:
+                return None, f"buys_5m={pool.get('buys_5m',0)} < {self.config.min_buys_5m}"
 
         if pool['liquidity'] < self.config.liq_min or pool['liquidity'] > self.config.liq_max:
             return None, f"liq=${pool['liquidity']:.0f} out of [{self.config.liq_min},{self.config.liq_max}]"
@@ -558,11 +668,7 @@ class FilterEngine:
         if self.config.require_social and len(pool['socials']) == 0:
             return None, "no_socials"
 
-        # Min buys_5m filter
-        if self.config.min_buys_5m > 0 and pool.get('buys_5m', 0) < self.config.min_buys_5m:
-            return None, f"buys_5m={pool.get('buys_5m',0)} < {self.config.min_buys_5m}"
-
-        # Dynamic rug filter: allow higher vol/liq for very new coins
+        # Dynamic rug filter
         try:
             age_sec = (datetime.datetime.now() - pool['created_at']).total_seconds()
         except:
@@ -587,20 +693,17 @@ class FilterEngine:
         filtered, reason = self.filter_and_score(pool)
         if not filtered:
             return None, reason
-
-        # 2026 momentum bonus
         bonus = 0
         if pool.get('volume_5m', 0) >= 1000: bonus += 20
         if pool.get('price_change_5m', 0) > 8: bonus += 15
         if pool.get('buy_ratio', 0) >= 0.75: bonus += 25
         filtered['score'] = filtered.get('score', 0) + bonus
-
         if filtered['score'] < self.config.momentum_score_threshold:
             return None, f"momentum_score={filtered['score']:.0f}"
         return filtered, "momentum_pass"
 
 # ============================================================================
-# 5. Trade Simulator (unchanged)
+# 5. Trade Simulator (unchanged, includes quantity)
 # ============================================================================
 class TradeSimulator:
     def __init__(self, notifier, config: BotConfig):
@@ -751,7 +854,6 @@ class TradeSimulator:
             pv = price * pos['quantity']
             pu = pv - pos['amount_usd']
             ppct = (pv / pos['amount_usd'] - 1) * 100
-            # Partial sell for high-score coins
             if pos.get('entry_score', 0) >= 80 and not pos.get('partial_sold') and ppct >= 30:
                 hq, hc = pos['quantity']/2, pos['amount_usd']/2
                 hp = {**pos, 'quantity': hq, 'amount_usd': hc}
@@ -771,7 +873,7 @@ class TradeSimulator:
         return sells
 
 # ============================================================================
-# 6. Reporter
+# 6. Reporter (unchanged)
 # ============================================================================
 class Reporter:
     def __init__(self, notifier):
@@ -860,11 +962,11 @@ class Reporter:
         logger.info("Equity curve saved.")
 
 # ============================================================================
-# 7. Keep-alive + health ping (optional)
+# 7. Keep-alive + health ping
 # ============================================================================
 def keep_alive():
     while True:
-        time.sleep(300)  # every 5 min
+        time.sleep(300)
         logger.info("[HEALTH] Bot is alive")
 threading.Thread(target=keep_alive, daemon=True).start()
 
@@ -904,13 +1006,11 @@ def run_bot():
                 msg = f"✅ {config.max_run_hours}h complete! P&L: ${simulator.balance - simulator.initial_balance:.2f}"
                 logger.info(msg); notifier.send(msg); break
 
-        # Refresh SOL and BNB prices every 30 min
         if (datetime.datetime.now() - last_price_upd).total_seconds() > 1800:
             get_sol_usd()
             get_bnb_usd()
             last_price_upd = datetime.datetime.now()
 
-        # Detection
         try:
             new_pools = detector.get_new_pools(config.chain_selector)
             momentum_pools = detector.get_momentum_pools(config.chain_selector, config)
@@ -920,7 +1020,6 @@ def run_bot():
             time.sleep(30)
             continue
 
-        # Filter & buy logic
         passed = rejected = 0
         reject_reasons = {}
 
@@ -954,7 +1053,6 @@ def run_bot():
                 continue
             passed += 1
 
-            # Per‑source threshold adjustment
             if filtered.get('source') == 'pumpfun':
                 threshold = max(15, config.score_threshold - 20)
             else:
@@ -984,7 +1082,6 @@ def run_bot():
         else:
             logger.info("[FILTER] 0 new candidates this cycle")
 
-        # Price updates
         if simulator.positions:
             chain_mints = defaultdict(list)
             for mint, pos in simulator.positions.items():
@@ -995,12 +1092,10 @@ def run_bot():
                     simulator.update_price(mint, data['price'])
                     simulator.update_trailing_stop(mint)
 
-        # Sells
         for sell in simulator.check_positions():
             if not sell.get('partial'):
                 reporter.update_daily_summary(sell['profit'])
 
-        # Periodic portfolio update
         if (datetime.datetime.now() - last_portfolio_upd).total_seconds() > 300:
             reporter.log_portfolio(simulator.balance, simulator.positions)
             last_portfolio_upd = datetime.datetime.now()
