@@ -49,7 +49,7 @@ class BotConfig:
     daily_loss_limit: float = float(os.getenv("DAILY_LOSS_LIMIT", "-15"))
     consecutive_loss_limit: int = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
     min_buys_5m: int = int(os.getenv("MIN_BUYS_5M", "0"))
-    min_buy_usd: float = float(os.getenv("MIN_BUY_USD", "0.5"))
+    min_buy_usd: float = float(os.getenv("MIN_BUY_USD", "5.0"))
 
     age_momentum_min: int = int(os.getenv("AGE_MOMENTUM_MIN", "900"))
     age_momentum_max: int = int(os.getenv("AGE_MOMENTUM_MAX", "43200"))
@@ -118,6 +118,7 @@ class Detector:
     def __init__(self, max_mints=25000, max_per_chain=15000):
         self.seen_mints = set()
         self.seen_mints_per_chain = defaultdict(set)
+        self.momentum_cooldown = {}          # mint -> timestamp last seen in momentum
         self.max_mints = max_mints
         self.max_per_chain = max_per_chain
         self.last_profile_fetch = 0
@@ -404,12 +405,13 @@ class Detector:
     def get_momentum_pools(self, selected_chain, config: BotConfig):
         momentum_pools = []
         now = time.time()
+        cooldown_seconds = 1800  # 30 minutes – coins can be re‑evaluated after this time
 
-        # 1. Birdeye trending (SOL only) – corrected URL and parsing
+        # 1. Birdeye trending (SOL only)
         if config.birdeye_api_key and selected_chain in ['SOL', 'ALL']:
             try:
                 url = "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=desc&offset=0&limit=50"
-                extra_headers = {"X-API-KEY": config.birdeye_api_key, "x-chain": "solana"}
+                extra_headers = {"x-api-key": config.birdeye_api_key, "x-chain": "solana"}
                 resp = self._get_with_backoff(url, extra_headers=extra_headers)
                 if resp and resp.status_code == 200:
                     try:
@@ -427,10 +429,15 @@ class Detector:
                     birdeye_new = 0
                     for item in items:
                         mint = item.get('address')
-                        if not mint or mint in self.seen_mints_per_chain['SOL']:
+                        if not mint:
                             continue
 
-                        created_at = datetime.datetime.now() - datetime.timedelta(seconds=config.age_momentum_min)
+                        # Cooldown check
+                        if mint in self.momentum_cooldown and now - self.momentum_cooldown[mint] < cooldown_seconds:
+                            continue
+
+                        # Use a reasonable fallback age (30 minutes)
+                        created_at = datetime.datetime.now() - datetime.timedelta(seconds=1800)
 
                         vol_24h = float(item.get('volume24hUSD', 0) or item.get('volume24h', 0))
                         vol_5m = vol_24h / 288 if vol_24h > 0 else config.volume_5m * config.volume_spike_mult
@@ -456,7 +463,7 @@ class Detector:
                             'source': 'birdeye_momentum',
                             'buy_ratio': buy_ratio
                         }
-                        self.seen_mints_per_chain['SOL'].add(mint)
+                        self.momentum_cooldown[mint] = now
                         momentum_pools.append(pool)
                         birdeye_new += 1
                     if birdeye_new > 0:
@@ -494,8 +501,13 @@ class Detector:
                        (sch == 'BASE' and chain_id != 'base'):
                         continue
                     mint = p.get('baseToken', {}).get('address')
-                    if not mint or mint in self.seen_mints_per_chain[sch]:
+                    if not mint:
                         continue
+
+                    # Cooldown check
+                    if mint in self.momentum_cooldown and now - self.momentum_cooldown[mint] < cooldown_seconds:
+                        continue
+
                     created_ts = p.get('pairCreatedAt', now * 1000)
                     if created_ts > 1e12:
                         created_ts /= 1000
@@ -526,7 +538,7 @@ class Detector:
                         'source': 'dexscreener_momentum',
                         'buy_ratio': buy_ratio
                     }
-                    self.seen_mints_per_chain[sch].add(mint)
+                    self.momentum_cooldown[mint] = now
                     momentum_pools.append(pool)
                     ds_new += 1
                 if ds_new > 0:
@@ -534,11 +546,10 @@ class Detector:
             except Exception as e:
                 logger.error(f"DexScreener momentum error for {sch}: {e}")
 
-        for chain in self.seen_mints_per_chain:
-            self.seen_mints.update(self.seen_mints_per_chain[chain])
-        if len(self.seen_mints) > self.max_mints:
-            self.seen_mints = set(list(self.seen_mints)[-self.max_mints:])
-        self._trim_per_chain()
+        # Cleanup old cooldown entries
+        for mint in list(self.momentum_cooldown.keys()):
+            if now - self.momentum_cooldown[mint] > 3600:  # keep only last hour
+                del self.momentum_cooldown[mint]
 
         logger.info(f"[MOMENTUM] Found {len(momentum_pools)} momentum candidates")
         return momentum_pools
@@ -581,7 +592,7 @@ class Detector:
         return all_prices
 
 # ============================================================================
-# 4. Filter Engine (New Launch + Momentum) – with FIXED substring check
+# 4. Filter Engine (New Launch + Momentum) – with optional min_buy_ratio filter
 # ============================================================================
 class FilterEngine:
     def __init__(self, config: BotConfig):
@@ -600,6 +611,10 @@ class FilterEngine:
                 return None, f"age_error={e}"
             if self.config.min_buys_5m > 0 and pool.get('buys_5m', 0) < self.config.min_buys_5m:
                 return None, f"buys_5m={pool.get('buys_5m',0)} < {self.config.min_buys_5m}"
+
+            # Optional min_buy_ratio filter (uncomment if desired)
+            # if pool.get('buy_ratio', 0) > 0 and pool.get('buy_ratio', 0) < 0.55:
+            #     return None, f"buy_ratio={pool.get('buy_ratio',0):.2f} too low"
 
         if pool['liquidity'] < self.config.liq_min or pool['liquidity'] > self.config.liq_max:
             return None, f"liq=${pool['liquidity']:.0f} out of [{self.config.liq_min},{self.config.liq_max}]"
@@ -643,7 +658,7 @@ class FilterEngine:
         return filtered, "momentum_pass"
 
 # ============================================================================
-# 5. Trade Simulator (unchanged, includes quantity)
+# 5. Trade Simulator (unchanged)
 # ============================================================================
 class TradeSimulator:
     def __init__(self, notifier, config: BotConfig):
@@ -811,7 +826,7 @@ class TradeSimulator:
         return sells
 
 # ============================================================================
-# 6. Reporter (unchanged)
+# 6. Reporter (with momentum split in equity plot)
 # ============================================================================
 class Reporter:
     def __init__(self, notifier):
@@ -844,7 +859,8 @@ class Reporter:
     def save_state(self, sim, det):
         pickle.dump({
             'simulator': {'balance': sim.balance, 'positions': sim.positions, 'trades': sim.trades},
-            'detector': {'seen_mints': list(det.seen_mints), 'seen_mints_per_chain': {k: list(v) for k, v in det.seen_mints_per_chain.items()}},
+            'detector': {'seen_mints': list(det.seen_mints), 'seen_mints_per_chain': {k: list(v) for k, v in det.seen_mints_per_chain.items()},
+                         'momentum_cooldown': det.momentum_cooldown},
             'daily_summary': self.daily_summary,
             'start_time': self.start_time.isoformat(),
             'consecutive_losses': self.consecutive_losses
@@ -857,6 +873,8 @@ class Reporter:
             det.seen_mints = set(s['detector']['seen_mints'])
             if 'seen_mints_per_chain' in s['detector']:
                 det.seen_mints_per_chain = {k: set(v) for k, v in s['detector']['seen_mints_per_chain'].items()}
+            if 'momentum_cooldown' in s['detector']:
+                det.momentum_cooldown = s['detector']['momentum_cooldown']
             self.daily_summary = s['daily_summary']
             self.start_time = datetime.datetime.fromisoformat(s.get('start_time', self.start_time.isoformat()))
             self.consecutive_losses = s.get('consecutive_losses', 0)
@@ -889,6 +907,8 @@ class Reporter:
         full = [t for t in trades if not t.get('partial')]
         if not full:
             return
+        momentum_trades = [t for t in full if t.get('is_momentum')]
+        logger.info(f"Equity plot: {len(full)} total trades ({len(momentum_trades)} momentum)")
         df = pd.DataFrame(full)
         df['cumulative'] = df['profit_usd'].cumsum() + self.initial_balance
         plt.figure(figsize=(12,4))
@@ -900,7 +920,7 @@ class Reporter:
         logger.info("Equity curve saved.")
 
 # ============================================================================
-# 7. Keep-alive
+# 7. Keep-alive (simple log)
 # ============================================================================
 def keep_alive():
     while True:
