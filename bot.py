@@ -33,55 +33,73 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# 1. Configuration (Only Telegram and Birdeye come from environment)
+# ============================================================================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_IDS  = [c.strip() for c in
+                       os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+    logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS must be set.")
+    sys.exit(1)
+
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")   # optional
+
+# All other settings are hardcoded (conservative, high‑safety defaults)
 @dataclass
 class BotConfig:
     # === TRADING ===
-    buy_amount: float = float(os.getenv("BUY_AMOUNT", "2.0"))
-    profit_target_pct: float = float(os.getenv("PROFIT_TARGET_PCT", "15.0"))
-    profit_target_abs: float = float(os.getenv("PROFIT_TARGET_ABS", "0.75"))
-    stop_loss_pct: float = float(os.getenv("STOP_LOSS_PCT", "10.0"))
-    timeout_min: int = int(os.getenv("TIMEOUT_MIN", "10"))
-    max_positions: int = int(os.getenv("MAX_POSITIONS", "10"))
+    buy_amount: float = 1.5
+    profit_target_pct: float = 15.0
+    profit_target_abs: float = 0.75
+    stop_loss_pct: float = 8.0
+    timeout_min: int = 10
+    max_positions: int = 8
 
-    # === SAFETY & FILTERS (TOP 1% EDGE) ===
-    score_threshold: int = int(os.getenv("SCORE_THRESHOLD", "20"))
-    safety_threshold: int = int(os.getenv("SAFETY_THRESHOLD", "85"))
-    max_dev_hold_pct: float = float(os.getenv("MAX_DEV_HOLD_PCT", "5.0"))
-    require_no_mint_authority: bool = os.getenv("REQUIRE_NO_MINT_AUTH", "true").lower() == "true"
-    require_no_freeze_authority: bool = os.getenv("REQUIRE_NO_FREEZE_AUTH", "true").lower() == "true"
-    honeypot_reject_rate: float = float(os.getenv("HONEYPOT_REJECT_RATE", "0.15"))
+    # === SAFETY & FILTERS (MORE CONSERVATIVE) ===
+    score_threshold: int = 35
+    safety_threshold: int = 92
+    max_dev_hold_pct: float = 5.0
+    require_no_mint_authority: bool = True
+    require_no_freeze_authority: bool = True
+    honeypot_reject_rate: float = 0.18
+
+    # === NEW CAUTIOUS FILTERS ===
+    min_buys_5m: int = 3
+    require_social: bool = True
 
     # === DETECTION & MOMENTUM ===
-    age_min: int = int(os.getenv("AGE_MIN", "10"))
-    age_max: int = int(os.getenv("AGE_MAX", "900"))
-    liq_min: int = int(os.getenv("LIQ_MIN", "500"))
-    liq_max: int = int(os.getenv("LIQ_MAX", "50000"))
-    volume_5m: int = int(os.getenv("VOLUME_5M", "10"))
-    min_buy_ratio: float = float(os.getenv("MIN_BUY_RATIO", "0.65"))
-    volume_spike_mult: float = float(os.getenv("VOLUME_SPIKE_MULT", "2.0"))
-    momentum_score_threshold: int = int(os.getenv("MOMENTUM_SCORE_THRESHOLD", "35"))
+    age_min: int = 15
+    age_max: int = 600
+    liq_min: int = 1500
+    liq_max: int = 50000
+    volume_5m: int = 25
+    min_buy_ratio: float = 0.70
+    volume_spike_mult: float = 2.5
+    momentum_score_threshold: int = 40
 
     # === RISK ===
-    daily_loss_limit: float = float(os.getenv("DAILY_LOSS_LIMIT", "-15"))
-    consecutive_loss_limit: int = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
-    min_buy_usd: float = float(os.getenv("MIN_BUY_USD", "0.5"))
+    daily_loss_limit: float = -12
+    consecutive_loss_limit: int = 4
+    min_buy_usd: float = 0.5
 
-    # === SIMULATED LATENCY (TOP 1% EDGE) ===
-    sim_latency_ms: int = int(os.getenv("SIM_LATENCY_MS", "80"))
-    sim_jito_success_rate: float = float(os.getenv("SIM_JITO_SUCCESS_RATE", "0.92"))
+    # === SIMULATED LATENCY ===
+    sim_latency_ms: int = 60
+    sim_jito_success_rate: float = 0.93
+
+    # === TELEGRAM CONTROL (ANTI-SPAM) ===
+    telegram_signals: bool = False   # ← No BUY SIGNAL spam
 
     # === OTHER ===
-    require_social: bool = os.getenv("REQUIRE_SOCIAL", "false").lower() == "true"
-    chain_selector: str = os.getenv("CHAIN_SELECTOR", "ALL")
-    max_run_hours: int = int(os.getenv("MAX_RUN_HOURS", "48"))
-    birdeye_api_key: str = os.getenv("BIRDEYE_API_KEY", "")
-    wss_enabled: bool = os.getenv("WSS_ENABLED", "true").lower() == "true"
-    wss_reconnect_delay: int = int(os.getenv("WSS_RECONNECT_DELAY", "5"))
+    chain_selector: str = "ALL"
+    max_run_hours: int = 48
+    wss_enabled: bool = True
+    wss_reconnect_delay: int = 5
 
 config = BotConfig()
 
 # ============================================================================
-# 1. Price helpers (SOL + BNB)
+# 2. Price helpers (SOL + BNB)
 # ============================================================================
 SOL_USD  = 130
 SOL_LOCK = threading.Lock()
@@ -117,7 +135,7 @@ def get_bnb_usd():
     return BNB_USD
 
 # ============================================================================
-# 2. Telegram Notifier
+# 3. Telegram Notifier
 # ============================================================================
 class TelegramNotifier:
     def __init__(self, token, chat_ids):
@@ -142,7 +160,7 @@ class TelegramNotifier:
                     time.sleep(2)
 
 # ============================================================================
-# 3. WebSocket Manager (PumpPortal)
+# 4. WebSocket Manager (PumpPortal)
 # ============================================================================
 PUMPPORTAL_URI = "wss://pumpportal.fun/api/data"
 
@@ -270,7 +288,7 @@ class WebSocketManager:
         }
 
 # ============================================================================
-# 4. Detector (REST polling – includes Four.meme)
+# 5. Detector (REST polling – includes Four.meme)
 # ============================================================================
 class Detector:
     def __init__(self, max_mints=25000, max_per_chain=15000):
@@ -615,10 +633,10 @@ class Detector:
         cooldown_sec   = 1800
 
         # Birdeye (SOL, requires free API key)
-        if cfg.birdeye_api_key and selected_chain in ['SOL', 'ALL']:
+        if BIRDEYE_API_KEY and selected_chain in ['SOL', 'ALL']:
             try:
                 url   = "https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=desc&offset=0&limit=50"
-                hdrs  = {"x-api-key": cfg.birdeye_api_key, "x-chain": "solana"}
+                hdrs  = {"x-api-key": BIRDEYE_API_KEY, "x-chain": "solana"}
                 resp  = self._get_with_backoff(url, extra_headers=hdrs)
                 if resp:
                     data  = resp.json()
@@ -769,7 +787,7 @@ class Detector:
         return all_prices
 
 # ============================================================================
-# 5. Safety Engine – Top 1% Rug Protection
+# 6. Safety Engine – Top 1% Rug Protection
 # ============================================================================
 class SafetyEngine:
     def __init__(self, cfg: BotConfig):
@@ -815,7 +833,7 @@ class SafetyEngine:
         return score, reason
 
 # ============================================================================
-# 6. Filter Engine (with safety integration)
+# 7. Filter Engine (with safety integration)
 # ============================================================================
 class FilterEngine:
     def __init__(self, cfg: BotConfig):
@@ -846,8 +864,23 @@ class FilterEngine:
         if pool.get('volume_5m', 0) < self.config.volume_5m:
             return None, f"vol5m=${pool.get('volume_5m',0):.1f}"
 
+        # NEW: require socials (default true)
         if self.config.require_social and len(pool['socials']) == 0:
             return None, "no_socials"
+
+        # NEW: require minimum buys (non-WSS tokens)
+        if source not in ('pumpportal_wss',) and self.config.min_buys_5m > 0 and pool.get('buys_5m', 0) < self.config.min_buys_5m:
+            return None, f"buys_5m={pool.get('buys_5m',0)}<{self.config.min_buys_5m}"
+
+        # Dynamic rug filter (allow higher vol/liq for very new coins)
+        try:
+            age_sec = (datetime.datetime.now() - pool['created_at']).total_seconds()
+        except:
+            age_sec = 300
+        max_vol_liq = 80 if age_sec < 300 else 50
+        vol_liq = (pool.get('volume_5m', 0) * 288) / max(pool['liquidity'], 1)
+        if vol_liq > max_vol_liq:
+            return None, f"rug_vol_liq={vol_liq:.1f}"
 
         # Scoring (weighted + safety bonus)
         liq_score = min(100, pool['liquidity'] / 5000 * 100) * 0.25
@@ -876,7 +909,7 @@ class FilterEngine:
         return filtered, "momentum_pass"
 
 # ============================================================================
-# 7. Trade Simulator (with latency & Jito)
+# 8. Trade Simulator (with latency & Jito)
 # ============================================================================
 class TradeSimulator:
     def __init__(self, notifier, cfg: BotConfig):
@@ -1061,7 +1094,7 @@ class TradeSimulator:
         return sells
 
 # ============================================================================
-# 8. Reporter (enhanced logging with safety)
+# 9. Reporter (enhanced logging)
 # ============================================================================
 class Reporter:
     def __init__(self, notifier):
@@ -1178,7 +1211,7 @@ class Reporter:
         logger.info("Equity curve saved.")
 
 # ============================================================================
-# 9. Risk Manager (Daily loss / consecutive losses)
+# 10. Risk Manager (Daily loss / consecutive losses)
 # ============================================================================
 class RiskManager:
     def __init__(self, cfg: BotConfig, reporter):
@@ -1195,7 +1228,7 @@ class RiskManager:
         return True
 
 # ============================================================================
-# 10. Cooldown Manager – Prevent re-buying dead tokens (Top 1% feature)
+# 11. Cooldown Manager – Prevent re-buying dead tokens
 # ============================================================================
 class CooldownManager:
     def __init__(self):
@@ -1218,7 +1251,7 @@ class CooldownManager:
         self.cooldowns = {m: e for m, e in self.cooldowns.items() if e > now}
 
 # ============================================================================
-# 11. Keep-alive
+# 12. Keep-alive
 # ============================================================================
 def keep_alive():
     while True:
@@ -1227,16 +1260,9 @@ def keep_alive():
 threading.Thread(target=keep_alive, daemon=True).start()
 
 # ============================================================================
-# 12. Main Bot Loop
+# 13. Main Bot Loop
 # ============================================================================
 def run_bot():
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_IDS  = [c.strip() for c in
-                           os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
-        logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS must be set.")
-        sys.exit(1)
-
     notifier  = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS)
     reporter  = Reporter(notifier)
     detector  = Detector()
@@ -1320,7 +1346,7 @@ def run_bot():
             filtered_candidates.append(pool)
         all_candidates = filtered_candidates
 
-        # ── 3. Buy / filter logic ────────────────────────────────────────────
+        # ── 3. Buy / filter logic (conservative + anti-spam) ──────────────────
         passed = rejected = 0
         reject_reasons = {}
 
@@ -1341,37 +1367,41 @@ def run_bot():
             if not filtered:
                 rejected += 1
                 reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
-                # Cooldown rejected tokens (safety, score, age, volume)
-                if (reason.startswith("SAFETY_FAIL_") or "score" in reason or "age" in reason or "vol5m" in reason):
-                    cooldown_mgr.set_cooldown(pool['mint'], 30)
+                # Cooldown rejected tokens (safety, score, age, vol5m, etc.)
+                if (reason.startswith("SAFETY_FAIL_") or "score" in reason or
+                    "age" in reason or "vol5m" in reason or "buys_5m" in reason):
+                    cooldown_mgr.set_cooldown(pool['mint'], 45)   # longer cooldown
                 continue
             passed += 1
 
-            # Lower threshold for fresh pump.fun / WSS launches
+            # Lower threshold for fresh launchpad sources
             if filtered.get('source') in ('pumpfun', 'pumpfun_rest', 'pumpportal_wss', 'fourmeme'):
-                threshold = max(15, config.score_threshold - 20)
+                threshold = max(20, config.score_threshold - 15)
             else:
                 threshold = config.score_threshold
 
             if filtered['score'] < threshold:
                 key = f"score={filtered['score']:.0f}<{threshold}"
                 reject_reasons[key] = reject_reasons.get(key, 0) + 1
-                cooldown_mgr.set_cooldown(filtered['mint'], 30)
+                cooldown_mgr.set_cooldown(filtered['mint'], 45)
                 continue
 
             reporter.log_detection(filtered)
-            notifier.send(
-                f"📈 BUY SIGNAL [{filtered['chain']}] {filtered['symbol']} ({filtered['name']})\n"
-                f"📋 CA: <code>{filtered['mint']}</code>\n"
-                f"Score: {filtered['score']:.1f} | Safety: {filtered.get('safety_score',0)} | "
-                f"Liq: ${filtered['liquidity']:,.0f} | Src: {filtered.get('source','?')}"
-            )
+
+            # ← ONLY send Telegram BUY SIGNAL if user explicitly enables it
+            if config.telegram_signals:
+                notifier.send(
+                    f"📈 BUY SIGNAL [{filtered['chain']}] {filtered['symbol']} ({filtered['name']})\n"
+                    f"📋 CA: <code>{filtered['mint']}</code>\n"
+                    f"Score: {filtered['score']:.1f} | Safety: {filtered.get('safety_score',0)} | "
+                    f"Liq: ${filtered['liquidity']:,.0f} | Src: {filtered.get('source','?')}"
+                )
 
             if can_buy_now and simulator.can_buy(config.max_positions, filtered.get('score', 0)):
                 r = simulator.simulate_buy(filtered, config.max_positions)
                 if r:
                     reporter.log_buy(filtered, r)
-                    cooldown_mgr.set_cooldown(filtered['mint'], 60)  # longer cooldown after buy
+                    cooldown_mgr.set_cooldown(filtered['mint'], 60)   # longer after buy
             elif not can_buy_now:
                 logger.info(f"⏸️ Skipping {filtered['symbol']} — risk pause active")
             else:
@@ -1427,7 +1457,7 @@ def run_bot():
     reporter.plot_equity(simulator.trades)
 
 # ============================================================================
-# 13. Auto-restart wrapper
+# 14. Auto-restart wrapper
 # ============================================================================
 if __name__ == "__main__":
     while True:
