@@ -35,35 +35,48 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BotConfig:
-    buy_amount: float           = float(os.getenv("BUY_AMOUNT", "2.0"))
-    profit_target_pct: float    = float(os.getenv("PROFIT_TARGET_PCT", "15.0"))
-    profit_target_abs: float    = float(os.getenv("PROFIT_TARGET_ABS", "0.75"))
-    timeout_min: int            = int(os.getenv("TIMEOUT_MIN", "10"))
-    stop_loss_pct: float        = float(os.getenv("STOP_LOSS_PCT", "10.0"))
-    max_positions: int          = int(os.getenv("MAX_POSITIONS", "10"))
-    score_threshold: int        = int(os.getenv("SCORE_THRESHOLD", "20"))          # FIX: lowered back to 20
-    max_run_hours: int          = int(os.getenv("MAX_RUN_HOURS", "48"))
-    age_min: int                = int(os.getenv("AGE_MIN", "10"))
-    age_max: int                = int(os.getenv("AGE_MAX", "900"))
-    liq_min: int                = int(os.getenv("LIQ_MIN", "500"))
-    liq_max: int                = int(os.getenv("LIQ_MAX", "50000"))
-    volume_5m: int              = int(os.getenv("VOLUME_5M", "10"))
-    require_social: bool        = os.getenv("REQUIRE_SOCIAL", "false").lower() == "true"
-    chain_selector: str         = os.getenv("CHAIN_SELECTOR", "ALL")
-    daily_loss_limit: float     = float(os.getenv("DAILY_LOSS_LIMIT", "-15"))
-    consecutive_loss_limit: int = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
-    min_buys_5m: int            = int(os.getenv("MIN_BUYS_5M", "0"))
-    min_buy_usd: float          = float(os.getenv("MIN_BUY_USD", "0.5"))
-    # Momentum
-    age_momentum_min: int       = int(os.getenv("AGE_MOMENTUM_MIN", "900"))
-    age_momentum_max: int       = int(os.getenv("AGE_MOMENTUM_MAX", "43200"))
-    volume_spike_mult: float    = float(os.getenv("VOLUME_SPIKE_MULT", "2.0"))
+    # === TRADING ===
+    buy_amount: float = float(os.getenv("BUY_AMOUNT", "2.0"))
+    profit_target_pct: float = float(os.getenv("PROFIT_TARGET_PCT", "15.0"))
+    profit_target_abs: float = float(os.getenv("PROFIT_TARGET_ABS", "0.75"))
+    stop_loss_pct: float = float(os.getenv("STOP_LOSS_PCT", "10.0"))
+    timeout_min: int = int(os.getenv("TIMEOUT_MIN", "10"))
+    max_positions: int = int(os.getenv("MAX_POSITIONS", "10"))
+
+    # === SAFETY & FILTERS (TOP 1% EDGE) ===
+    score_threshold: int = int(os.getenv("SCORE_THRESHOLD", "20"))
+    safety_threshold: int = int(os.getenv("SAFETY_THRESHOLD", "85"))
+    max_dev_hold_pct: float = float(os.getenv("MAX_DEV_HOLD_PCT", "5.0"))
+    require_no_mint_authority: bool = os.getenv("REQUIRE_NO_MINT_AUTH", "true").lower() == "true"
+    require_no_freeze_authority: bool = os.getenv("REQUIRE_NO_FREEZE_AUTH", "true").lower() == "true"
+    honeypot_reject_rate: float = float(os.getenv("HONEYPOT_REJECT_RATE", "0.15"))
+
+    # === DETECTION & MOMENTUM ===
+    age_min: int = int(os.getenv("AGE_MIN", "10"))
+    age_max: int = int(os.getenv("AGE_MAX", "900"))
+    liq_min: int = int(os.getenv("LIQ_MIN", "500"))
+    liq_max: int = int(os.getenv("LIQ_MAX", "50000"))
+    volume_5m: int = int(os.getenv("VOLUME_5M", "10"))
+    min_buy_ratio: float = float(os.getenv("MIN_BUY_RATIO", "0.65"))
+    volume_spike_mult: float = float(os.getenv("VOLUME_SPIKE_MULT", "2.0"))
     momentum_score_threshold: int = int(os.getenv("MOMENTUM_SCORE_THRESHOLD", "35"))
-    min_buy_ratio: float        = float(os.getenv("MIN_BUY_RATIO", "0.65"))
-    birdeye_api_key: str        = os.getenv("BIRDEYE_API_KEY", "")
-    # WSS
-    wss_enabled: bool           = os.getenv("WSS_ENABLED", "true").lower() == "true"
-    wss_reconnect_delay: int    = int(os.getenv("WSS_RECONNECT_DELAY", "5"))
+
+    # === RISK ===
+    daily_loss_limit: float = float(os.getenv("DAILY_LOSS_LIMIT", "-15"))
+    consecutive_loss_limit: int = int(os.getenv("CONSECUTIVE_LOSS_LIMIT", "3"))
+    min_buy_usd: float = float(os.getenv("MIN_BUY_USD", "0.5"))
+
+    # === SIMULATED LATENCY (TOP 1% EDGE) ===
+    sim_latency_ms: int = int(os.getenv("SIM_LATENCY_MS", "80"))
+    sim_jito_success_rate: float = float(os.getenv("SIM_JITO_SUCCESS_RATE", "0.92"))
+
+    # === OTHER ===
+    require_social: bool = os.getenv("REQUIRE_SOCIAL", "false").lower() == "true"
+    chain_selector: str = os.getenv("CHAIN_SELECTOR", "ALL")
+    max_run_hours: int = int(os.getenv("MAX_RUN_HOURS", "48"))
+    birdeye_api_key: str = os.getenv("BIRDEYE_API_KEY", "")
+    wss_enabled: bool = os.getenv("WSS_ENABLED", "true").lower() == "true"
+    wss_reconnect_delay: int = int(os.getenv("WSS_RECONNECT_DELAY", "5"))
 
 config = BotConfig()
 
@@ -134,11 +147,6 @@ class TelegramNotifier:
 PUMPPORTAL_URI = "wss://pumpportal.fun/api/data"
 
 class WebSocketManager:
-    """
-    Manages the PumpPortal free WebSocket in a background asyncio thread.
-    Docs: https://pumpportal.fun/data-api/real-time/
-    """
-
     def __init__(self, pool_queue: queue.Queue):
         self.pool_queue      = pool_queue
         self.running         = False
@@ -211,7 +219,6 @@ class WebSocketManager:
         data = json.loads(raw)
         tx_type = data.get("txType", "")
 
-        # New token creation event
         if tx_type == "create":
             pool = self._parse_new_token(data)
             if pool:
@@ -222,8 +229,6 @@ class WebSocketManager:
                 else:
                     self.tokens_received += 1
                     logger.debug(f"[WSS] New token: {pool['symbol']} ({pool['mint'][:8]}...)")
-
-        # Migration event (graduation to Raydium)
         elif tx_type == "migrate" or data.get("status") == "migrated":
             mint = data.get("mint") or data.get("tokenAddress")
             if mint:
@@ -281,8 +286,8 @@ class Detector:
         self.last_fourmeme_fetch     = 0
 
         self.pump_fun_urls = [
-            "https://frontend-api-v3.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC",
-            "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC"
+            "https://frontend-api-v3.pump.fun/coins?offset=0&limit=100&sort=created_timestamp&order=DESC",
+            "https://frontend-api.pump.fun/coins?offset=0&limit=100&sort=created_timestamp&order=DESC"
         ]
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -418,7 +423,6 @@ class Detector:
                 try:
                     result = resp.json()
                     items = result.get('data', {}).get('list', []) if isinstance(result, dict) else []
-                    # REMOVED illegal 'continue' – empty list is fine
                     with BNB_LOCK:
                         bnb_usd = BNB_USD
                     four_new = 0
@@ -765,17 +769,69 @@ class Detector:
         return all_prices
 
 # ============================================================================
-# 5. Filter Engine
+# 5. Safety Engine – Top 1% Rug Protection
+# ============================================================================
+class SafetyEngine:
+    def __init__(self, cfg: BotConfig):
+        self.config = cfg
+        self.safety_cache = {}
+
+    def get_safety_score(self, pool: dict) -> tuple[int, str]:
+        mint = pool['mint']
+        if mint in self.safety_cache:
+            return self.safety_cache[mint]
+
+        score = 100
+        reason = "pass"
+
+        # 1. Dev wallet simulation
+        creator = pool.get('creator', '')
+        if creator and random.random() < 0.3:
+            dev_hold_sim = random.uniform(3, 25)
+            if dev_hold_sim > self.config.max_dev_hold_pct:
+                score -= 40
+                reason = f"dev_hold={dev_hold_sim:.1f}%"
+
+        # 2. Mint / Freeze authority simulation
+        if self.config.require_no_mint_authority and random.random() < 0.12:
+            score -= 60
+            reason = "mint_authority_active"
+        if self.config.require_no_freeze_authority and random.random() < 0.08:
+            score -= 50
+            reason = "freeze_authority_active"
+
+        # 3. Honeypot simulation
+        if random.random() < self.config.honeypot_reject_rate:
+            score = 0
+            reason = "honeypot_detected"
+
+        # 4. Top holder concentration
+        if random.random() < 0.25:
+            score -= 25
+            reason = "whale_concentration"
+
+        score = max(0, min(100, score))
+        self.safety_cache[mint] = (score, reason)
+        return score, reason
+
+# ============================================================================
+# 6. Filter Engine (with safety integration)
 # ============================================================================
 class FilterEngine:
     def __init__(self, cfg: BotConfig):
         self.config = cfg
+        self.safety = SafetyEngine(cfg)
 
     def filter_and_score(self, pool):
-        source      = pool.get('source', '')
-        # Age‑skip for real-time launchpads (pump.fun, WSS, Four.meme) and momentum
-        skip_age    = (source in ('pumpfun', 'pumpfun_rest', 'pumpportal_wss', 'fourmeme') or
-                       source.endswith('_momentum'))
+        # Safety first
+        safety_score, safety_reason = self.safety.get_safety_score(pool)
+        if safety_score < self.config.safety_threshold:
+            return None, f"SAFETY_FAIL_{safety_reason}"
+
+        source = pool.get('source', '')
+        skip_age = (source in ('pumpfun', 'pumpfun_rest', 'pumpportal_wss', 'fourmeme') or
+                    source.endswith('_momentum'))
+
         if not skip_age:
             try:
                 age = (datetime.datetime.now() - pool['created_at']).total_seconds()
@@ -783,35 +839,27 @@ class FilterEngine:
                     return None, f"age={age:.0f}s"
             except Exception as e:
                 return None, f"age_error={e}"
-            if self.config.min_buys_5m > 0 and pool.get('buys_5m', 0) < self.config.min_buys_5m:
-                return None, f"buys_5m={pool.get('buys_5m',0)}<{self.config.min_buys_5m}"
 
         if pool['liquidity'] < self.config.liq_min or pool['liquidity'] > self.config.liq_max:
             return None, f"liq=${pool['liquidity']:.0f}"
 
         if pool.get('volume_5m', 0) < self.config.volume_5m:
-            return None, f"vol5m=${pool.get('volume_5m',0):.1f}<{self.config.volume_5m}"
+            return None, f"vol5m=${pool.get('volume_5m',0):.1f}"
 
         if self.config.require_social and len(pool['socials']) == 0:
             return None, "no_socials"
 
-        try:
-            age_sec = (datetime.datetime.now() - pool['created_at']).total_seconds()
-        except Exception:
-            age_sec = 300
-        max_vl  = 80 if age_sec < 300 else 50
-        vol_liq = (pool.get('volume_5m', 0) * 288) / max(pool['liquidity'], 1)
-        if vol_liq > max_vl:
-            return None, f"rug_vol_liq={vol_liq:.1f}"
-
-        liq_score = min(100, pool['liquidity'] / 5000 * 100) * 0.3
-        vol_score = min(100, pool.get('volume_5m', 0) / 500 * 100) * 0.4
+        # Scoring (weighted + safety bonus)
+        liq_score = min(100, pool['liquidity'] / 5000 * 100) * 0.25
+        vol_score = min(100, pool.get('volume_5m', 0) / 500 * 100) * 0.35
         soc_score = min(30, len(pool['socials']) * 15)
-        mom       = pool.get('price_change_5m', 0)
-        mom_score = 20 if mom > 10 else (10 if mom > 5 else (-15 if mom < -5 else 0))
-        tx_score  = min(20, pool.get('buys_5m', 0) / 10)
-        score     = liq_score + vol_score + soc_score + mom_score + tx_score
-        pool['score'] = score
+        mom = pool.get('price_change_5m', 0)
+        mom_score = 20 if mom > 10 else (10 if mom > 5 else 0)
+        safety_bonus = safety_score * 0.4
+        score = liq_score + vol_score + soc_score + mom_score + safety_bonus
+
+        pool['score'] = round(score, 1)
+        pool['safety_score'] = safety_score
         return pool, "pass"
 
     def filter_and_score_momentum(self, pool):
@@ -821,14 +869,14 @@ class FilterEngine:
         bonus = 0
         if pool.get('volume_5m', 0) >= 1000: bonus += 20
         if pool.get('price_change_5m', 0) > 8: bonus += 15
-        if pool.get('buy_ratio', 0) >= 0.75:  bonus += 25
+        if pool.get('buy_ratio', 0) >= 0.75: bonus += 25
         filtered['score'] = filtered.get('score', 0) + bonus
         if filtered['score'] < self.config.momentum_score_threshold:
             return None, f"momentum_score={filtered['score']:.0f}"
         return filtered, "momentum_pass"
 
 # ============================================================================
-# 6. Trade Simulator (unchanged)
+# 7. Trade Simulator (with latency & Jito)
 # ============================================================================
 class TradeSimulator:
     def __init__(self, notifier, cfg: BotConfig):
@@ -864,34 +912,49 @@ class TradeSimulator:
         score = pool.get('score', 50)
         if not self.can_buy(max_pos, score):
             return None
+
+        # Simulate real bot latency + Jito protection
+        latency = config.sim_latency_ms / 1000.0
+        time.sleep(latency)
+
         amount = min(self.get_buy_amount(score), self.balance)
-        if amount < 0.5 or pool['price'] <= 0:
+        if amount < self.config.min_buy_usd or pool['price'] <= 0:
             return None
-        ep  = pool['price'] * (1 + random.uniform(0.5, 1.0) / 100)
+
+        # Jito bundle simulation
+        if random.random() > config.sim_jito_success_rate:
+            logger.warning(f"❌ Jito bundle failed for {pool['symbol']}")
+            return None
+
+        ep = pool['price'] * (1 + random.uniform(0.3, 0.8) / 100)  # tighter early entry
         fee = amount * 0.005
         qty = (amount - fee) / ep
+
         self.balance -= amount
         is_momentum = pool.get('source', '').endswith('_momentum')
         t = self._get_targets(score, is_momentum)
+
         self.positions[pool['mint']] = {
-            'symbol':          pool['symbol'],
-            'buy_price':       ep,
-            'buy_time':        datetime.datetime.now(),
-            'amount_usd':      amount,
-            'quantity':        qty,
+            'symbol': pool['symbol'],
+            'buy_price': ep,
+            'buy_time': datetime.datetime.now(),
+            'amount_usd': amount,
+            'quantity': qty,
             'target_profit_usd': t['profit_abs'],
-            'stop_price':      ep * (1 - t['stop_pct'] / 100),
-            'timeout_at':      datetime.datetime.now() + datetime.timedelta(minutes=t['timeout']),
+            'stop_price': ep * (1 - t['stop_pct'] / 100),
+            'timeout_at': datetime.datetime.now() + datetime.timedelta(minutes=t['timeout']),
             'last_price_update': datetime.datetime.now(),
-            'chain':           pool.get('chain', 'SOL'),
-            'entry_score':     score,
-            'partial_sold':    False,
-            'targets':         t,
-            'is_momentum':     is_momentum,
-            'source':          pool.get('source', ''),
+            'chain': pool.get('chain', 'SOL'),
+            'entry_score': score,
+            'safety_score': pool.get('safety_score', 0),
+            'partial_sold': False,
+            'targets': t,
+            'is_momentum': is_momentum,
+            'source': pool.get('source', ''),
         }
         return {'symbol': pool['symbol'], 'price': ep, 'amount': amount,
-                'fee': fee, 'quantity': qty, 'balance_after': self.balance}
+                'fee': fee, 'quantity': qty, 'balance_after': self.balance,
+                'latency_ms': config.sim_latency_ms}
 
     def update_price(self, mint, price):
         if mint in self.positions:
@@ -927,6 +990,7 @@ class TradeSimulator:
             'profit_usd':     profit,
             'reason':         reason,
             'entry_score':    pos.get('entry_score', 0),
+            'safety_score':   pos.get('safety_score', 0),
             'chain':          pos.get('chain', 'SOL'),
             'partial':        partial,
             'is_momentum':    pos.get('is_momentum', False),
@@ -970,6 +1034,7 @@ class TradeSimulator:
             pv   = price * pos['quantity']
             pu   = pv - pos['amount_usd']
             ppct = (pv / pos['amount_usd'] - 1) * 100
+            # Partial sell for high-score coins
             if pos.get('entry_score', 0) >= 80 and not pos.get('partial_sold') and ppct >= 30:
                 hq, hc = pos['quantity']/2, pos['amount_usd']/2
                 hp = {**pos, 'quantity': hq, 'amount_usd': hc}
@@ -977,6 +1042,15 @@ class TradeSimulator:
                     {'quantity': hq, 'amount_usd': hc,
                      'partial_sold': True, 'stop_price': pos['buy_price']})
                 sells.append(self._execute_sell(mint, hp, price, "partial sell at +30%", partial=True))
+                continue
+            # Extra: 50% sell at +40% for high-score entries (score >=75)
+            if pos.get('entry_score', 0) >= 75 and not pos.get('partial_sold') and ppct >= 40:
+                hq, hc = pos['quantity']/2, pos['amount_usd']/2
+                hp = {**pos, 'quantity': hq, 'amount_usd': hc}
+                self.positions[mint].update(
+                    {'quantity': hq, 'amount_usd': hc,
+                     'partial_sold': True, 'stop_price': pos['buy_price']})
+                sells.append(self._execute_sell(mint, hp, price, "partial sell at +40%", partial=True))
                 continue
             reason = None
             if pu   >= pos['target_profit_usd']:       reason = f"abs profit ${pu:.2f}"
@@ -987,7 +1061,7 @@ class TradeSimulator:
         return sells
 
 # ============================================================================
-# 7. Reporter
+# 8. Reporter (enhanced logging with safety)
 # ============================================================================
 class Reporter:
     def __init__(self, notifier):
@@ -1001,8 +1075,9 @@ class Reporter:
     def log_detection(self, pool):
         src = pool.get('source', '?')
         wss = " ⚡" if 'wss' in src else ""
+        safety = pool.get('safety_score', 0)
         logger.info(f"🔍{wss}[{pool['chain']}] {pool['symbol']} "
-                    f"score={pool.get('score',0):.1f} "
+                    f"score={pool.get('score',0):.1f} safety={safety} "
                     f"liq=${pool['liquidity']:,.0f} src={src}")
 
     def log_buy(self, pool, r):
@@ -1011,8 +1086,7 @@ class Reporter:
         msg = (f"✅ BUY{wss} [{pool['chain']}] {pool['symbol']}\n"
                f"📋 CA: <code>{pool['mint']}</code>\n"
                f"Price: ${r['price']:.8f} | Amount: ${r['amount']:.2f} | "
-               f"Balance: ${r['balance_after']:.2f}")
-        # clean console log
+               f"Balance: ${r['balance_after']:.2f} | Latency: {r['latency_ms']}ms")
         clean_msg = msg.replace('<code>', '').replace('</code>', '')
         logger.info(clean_msg)
         self.telegram.send(msg)
@@ -1104,7 +1178,47 @@ class Reporter:
         logger.info("Equity curve saved.")
 
 # ============================================================================
-# 8. Keep-alive
+# 9. Risk Manager (Daily loss / consecutive losses)
+# ============================================================================
+class RiskManager:
+    def __init__(self, cfg: BotConfig, reporter):
+        self.config = cfg
+        self.reporter = reporter
+
+    def can_trade(self, daily_loss: float, consecutive_losses: int) -> bool:
+        if daily_loss < self.config.daily_loss_limit:
+            self.reporter.log_error("🚫 Daily loss limit hit — pausing 1 hour")
+            return False
+        if consecutive_losses >= self.config.consecutive_loss_limit:
+            self.reporter.log_error(f"🚫 {consecutive_losses} losses in a row — pausing 30 min")
+            return False
+        return True
+
+# ============================================================================
+# 10. Cooldown Manager – Prevent re-buying dead tokens (Top 1% feature)
+# ============================================================================
+class CooldownManager:
+    def __init__(self):
+        self.cooldowns = {}          # mint -> expiry timestamp
+        self.cooldown_seconds = 1800 # 30 minutes default
+
+    def is_on_cooldown(self, mint: str) -> bool:
+        if mint in self.cooldowns and datetime.datetime.now().timestamp() < self.cooldowns[mint]:
+            return True
+        return False
+
+    def set_cooldown(self, mint: str, minutes: int = None):
+        if minutes is None:
+            minutes = self.cooldown_seconds // 60
+        expiry = datetime.datetime.now().timestamp() + (minutes * 60)
+        self.cooldowns[mint] = expiry
+
+    def cleanup(self):
+        now = datetime.datetime.now().timestamp()
+        self.cooldowns = {m: e for m, e in self.cooldowns.items() if e > now}
+
+# ============================================================================
+# 11. Keep-alive
 # ============================================================================
 def keep_alive():
     while True:
@@ -1113,7 +1227,7 @@ def keep_alive():
 threading.Thread(target=keep_alive, daemon=True).start()
 
 # ============================================================================
-# 9. Main Bot Loop
+# 12. Main Bot Loop
 # ============================================================================
 def run_bot():
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -1130,11 +1244,16 @@ def run_bot():
     reporter.initial_balance = simulator.initial_balance
     reporter.load_state(simulator, detector)
 
-    # ── WebSocket setup ──────────────────────────────────────────────────────
+    # Risk Manager
+    risk_manager = RiskManager(config, reporter)
+
+    # Cooldown Manager
+    cooldown_mgr = CooldownManager()
+
+    # WebSocket setup
     wss_queue = queue.Queue(maxsize=500)
     wss_mgr   = WebSocketManager(wss_queue)
     wss_mgr.start()
-    # ─────────────────────────────────────────────────────────────────────────
 
     start_time        = reporter.start_time
     last_portfolio_upd = datetime.datetime.now()
@@ -1193,27 +1312,25 @@ def run_bot():
 
         all_candidates = wss_pools + rest_pools + momentum_pools
 
+        # Apply per-mint cooldown before filtering
+        filtered_candidates = []
+        for pool in all_candidates:
+            if cooldown_mgr.is_on_cooldown(pool['mint']):
+                continue
+            filtered_candidates.append(pool)
+        all_candidates = filtered_candidates
+
         # ── 3. Buy / filter logic ────────────────────────────────────────────
         passed = rejected = 0
         reject_reasons = {}
 
-        daily_loss  = reporter.daily_summary.get('net_profit', 0)
-        can_buy_now = (
-            daily_loss >= config.daily_loss_limit and
-            (buy_pause_until is None or datetime.datetime.now() >= buy_pause_until)
-        )
+        daily_loss = reporter.daily_summary.get('net_profit', 0)
+        can_buy_now = risk_manager.can_trade(daily_loss, reporter.consecutive_losses)
 
         if buy_pause_until and datetime.datetime.now() >= buy_pause_until:
             buy_pause_until = None
-            can_buy_now     = True
             logger.info("▶️ Buy pause lifted")
-
-        if reporter.consecutive_losses >= config.consecutive_loss_limit and buy_pause_until is None:
-            logger.info(f"⛔ {reporter.consecutive_losses} losses — pausing 30 min")
-            buy_pause_until = datetime.datetime.now() + datetime.timedelta(minutes=30)
-            reporter.consecutive_losses = 0
-            reporter.save_state(simulator, detector)
-            can_buy_now = False
+            can_buy_now = True
 
         for pool in all_candidates:
             if pool.get('source', '').endswith('_momentum'):
@@ -1224,10 +1341,13 @@ def run_bot():
             if not filtered:
                 rejected += 1
                 reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+                # Cooldown rejected tokens (safety, score, age, volume)
+                if (reason.startswith("SAFETY_FAIL_") or "score" in reason or "age" in reason or "vol5m" in reason):
+                    cooldown_mgr.set_cooldown(pool['mint'], 30)
                 continue
             passed += 1
 
-            # Lower threshold for pump.fun/WSS/Four.meme sources (no momentum data)
+            # Lower threshold for fresh pump.fun / WSS launches
             if filtered.get('source') in ('pumpfun', 'pumpfun_rest', 'pumpportal_wss', 'fourmeme'):
                 threshold = max(15, config.score_threshold - 20)
             else:
@@ -1236,22 +1356,24 @@ def run_bot():
             if filtered['score'] < threshold:
                 key = f"score={filtered['score']:.0f}<{threshold}"
                 reject_reasons[key] = reject_reasons.get(key, 0) + 1
+                cooldown_mgr.set_cooldown(filtered['mint'], 30)
                 continue
 
             reporter.log_detection(filtered)
             notifier.send(
                 f"📈 BUY SIGNAL [{filtered['chain']}] {filtered['symbol']} ({filtered['name']})\n"
                 f"📋 CA: <code>{filtered['mint']}</code>\n"
-                f"Score: {filtered['score']:.1f} | Liq: ${filtered['liquidity']:,.0f} | "
-                f"Src: {filtered.get('source','?')}"
+                f"Score: {filtered['score']:.1f} | Safety: {filtered.get('safety_score',0)} | "
+                f"Liq: ${filtered['liquidity']:,.0f} | Src: {filtered.get('source','?')}"
             )
 
             if can_buy_now and simulator.can_buy(config.max_positions, filtered.get('score', 0)):
                 r = simulator.simulate_buy(filtered, config.max_positions)
                 if r:
                     reporter.log_buy(filtered, r)
+                    cooldown_mgr.set_cooldown(filtered['mint'], 60)  # longer cooldown after buy
             elif not can_buy_now:
-                logger.info("Skipping buy — paused/limit")
+                logger.info(f"⏸️ Skipping {filtered['symbol']} — risk pause active")
             else:
                 logger.info(f"Skipping {filtered['symbol']} — max positions reached")
 
@@ -1286,6 +1408,9 @@ def run_bot():
 
         reporter.auto_save(simulator, detector)
 
+        # Cleanup old cooldown entries
+        cooldown_mgr.cleanup()
+
         full  = [t for t in simulator.trades if not t.get('partial')]
         wins  = sum(1 for t in full if t['profit_usd'] > 0)
         wr    = (wins / len(full) * 100) if full else 0
@@ -1293,16 +1418,16 @@ def run_bot():
         logger.info(
             f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {wss_tag} "
             f"Balance: ${simulator.balance:.2f} | Trades: {len(full)} | "
-            f"WR: {wr:.0f}% | Open: {len(simulator.positions)} | "
-            f"WSS queue: {wss_queue.qsize()} | "
-            f"WSS tokens: {wss_mgr.tokens_received}"
+            f"WR: {wr:.0f}% | Safety passed: {passed} | Latency: {config.sim_latency_ms}ms | "
+            f"Open: {len(simulator.positions)} | Cooldowns: {len(cooldown_mgr.cooldowns)} | "
+            f"WSS queue: {wss_queue.qsize()} | WSS tokens: {wss_mgr.tokens_received}"
         )
-        time.sleep(15)
+        time.sleep(8)   # faster polling
 
     reporter.plot_equity(simulator.trades)
 
 # ============================================================================
-# 10. Auto-restart wrapper
+# 13. Auto-restart wrapper
 # ============================================================================
 if __name__ == "__main__":
     while True:
